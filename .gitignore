@@ -1,0 +1,9 @@
+# about ESP-IDF 
+build/
+sdkconfig
+sdkconfig.old
+dependencies.lock
+main/Kconfig.projbuild
+
+# about IDE
+.vscode/
