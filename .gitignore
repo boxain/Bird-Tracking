@@ -7,3 +7,7 @@ main/Kconfig.projbuild
 
 # about IDE
 .vscode/
+project_tree.txt
+
+# about model
+model/
