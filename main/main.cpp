@@ -410,74 +410,85 @@ static void camera_init_task(void* pvParameters){
 
         while(1) {
             ESP_LOGI("Camera", "Taking picture...");
+
             // 當 JPEG 的壓縮率太低時，會造成寫入溢出 FB-OVF，而當 FB-OVF 發生卻又沒有清除，造成 NO-EOI，並形成 recursive，最後發生 stack overflow
-            // 後續補 merge request
             camera_fb_t* pic = esp_camera_fb_get();
             if(pic == NULL){
                 ESP_LOGE("Camera", "Take picture failed");
                 vTaskDelay(100 / portTICK_PERIOD_MS);
                 continue;
             }
+            
             ESP_LOGI("Camera", "Picture taken! Its size was: %zu bytes, width: %zu, height: %zu.", pic->len, pic->width, pic->height);
 
             // if websocket does't connected, and then release resouces and continues
             bool websocket_connected = esp_websocket_client_is_connected(websocket_client);
-            if(websocket_connected){
-
-                
-                // convert image format
-                size_t rgb_len = pic->height*pic->width*2;
-                uint8_t* rgb_buffer = (uint8_t*)malloc(rgb_len);
-                if(rgb_buffer == NULL){
-                    ESP_LOGE("Camera", "RGB Buffer allocate failed");
-                    esp_camera_fb_return(pic);
-                    continue;
-                }
-
-                bool conversion_success = jpg2rgb565(pic->buf, pic->len, rgb_buffer, JPG_SCALE_NONE);
-                // model inference
-                std::vector<std::vector<int>> bounding_boxes = model_inference_task(rgb_buffer, pic->width, pic->height, 3);
-                free(rgb_buffer);
-                rgb_buffer=NULL;
-
-                if(conversion_success){
-                    uint8_t* jpeg_buffer = (uint8_t*)malloc(pic->len+1);
-                    if(jpeg_buffer == NULL){
-                        ESP_LOGE("Camera", "JPEG Buffer allocate failed");
-                        esp_camera_fb_return(pic);
-                        continue;
-                    }
-                    memcpy(jpeg_buffer, pic->buf, pic->len);
-                    
-                    websocket_sending_message_t msg = {0};
-                    msg.type = 1;
-                    msg.image_len = pic->len;
-                    msg.image_data = jpeg_buffer;
-                    msg.bounding_boxes = std::move(bounding_boxes);
-                    msg.action = ACTION_RETURN_INFERENCE;
-                    msg.status = STATUS_COMPLETED;
-
-                    // --- Measure Queue sending cost time
-                    int64_t queue_start_time = esp_timer_get_time();
-                    BaseType_t send_result = xQueueSend(websocket_sending_message_queue, &msg, 0);
-                    int64_t queue_end_time = esp_timer_get_time();
-                    int64_t queue_cost = queue_end_time - queue_start_time;
-    
-                    if( send_result == pdPASS ){
-                        frame_count++;
-                        ESP_LOGI("FPS", "Queue sending cost: %lld millseconds", queue_cost / 1000);
-                    }else{
-                        free(jpeg_buffer);
-                        jpeg_buffer = NULL;
-                    }
-                    
-                }else{
-                    ESP_LOGE("Camera", "Image converstion failed.");
-                }
-            }else{
+            if(!websocket_connected){
                 ESP_LOGE("Websocket", "Websocket doesn't connected.");
+                esp_camera_fb_return(pic);
+                continue;
             }
-            
+
+            // allocate heap for RGB565 format, if failed to allocate, released resources and continues
+            size_t rgb_len = pic->height*pic->width*2;
+            uint8_t* rgb_buffer = (uint8_t*)malloc(rgb_len);
+            if(rgb_buffer == NULL){
+                ESP_LOGE("Camera", "RGB Buffer allocate failed");
+                esp_camera_fb_return(pic);
+                continue;
+            }
+
+            // convert image format from JPEG to RGB565, if failed convert, released resources and continues
+            bool conversion_success = jpg2rgb565(pic->buf, pic->len, rgb_buffer, JPG_SCALE_NONE);
+            if(!conversion_success){
+                ESP_LOGE("Camera", "Image converstion failed.");
+                free(rgb_buffer);
+                esp_camera_fb_return(pic);
+                rgb_buffer=NULL;
+                continue;
+            }
+
+            // model inference, when inference completed, release memory about RGB565
+            std::vector<std::vector<int>> bounding_boxes = model_inference_task(rgb_buffer, pic->width, pic->height, 3);
+            free(rgb_buffer);
+            rgb_buffer=NULL;
+
+
+            // allocate heap for JPEG buffer, in oder to avoid null pointer reference in websocket_sending_message_queue
+            // if failed, released reousrces
+            uint8_t* jpeg_buffer = (uint8_t*)malloc(pic->len+1);
+            if(jpeg_buffer == NULL){
+                ESP_LOGE("Camera", "JPEG Buffer allocate failed");
+                esp_camera_fb_return(pic);
+                continue;
+            }
+
+            // memory copy
+            memcpy(jpeg_buffer, pic->buf, pic->len);
+
+            // prepare sending message struct
+            websocket_sending_message_t msg = {0};
+            msg.type = 1;
+            msg.image_len = pic->len;
+            msg.image_data = jpeg_buffer;
+            msg.bounding_boxes = std::move(bounding_boxes);
+            msg.action = ACTION_RETURN_INFERENCE;
+            msg.status = STATUS_COMPLETED;
+
+            // --- Measure Queue sending cost time
+            int64_t queue_start_time = esp_timer_get_time();
+            BaseType_t send_result = xQueueSend(websocket_sending_message_queue, &msg, 0);
+            int64_t queue_end_time = esp_timer_get_time();
+            int64_t queue_cost = queue_end_time - queue_start_time;
+
+            if( send_result == pdPASS ){
+                frame_count++;
+                ESP_LOGI("FPS", "Queue sending cost: %lld millseconds", queue_cost / 1000);
+            }else{
+                free(jpeg_buffer);
+                jpeg_buffer = NULL;
+            }
+    
             esp_camera_fb_return(pic);
 
             // Measure FPS & Sending Queue spaces
@@ -941,7 +952,7 @@ static void sdmmc_card_init_task(){
 extern "C" void app_main(void){
     /**
      * 
-     * 拍攝 JPEG 再轉 RGB565 進行推論
+     * 完成 OTA
      * 
      */
     flash_init();
