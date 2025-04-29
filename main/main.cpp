@@ -48,7 +48,7 @@ static int s_retry_num = 0;
 /*
     WEBSOCKET SETTING
 */
-#define WEBSOCKET_HOST "192.168.1.103"
+#define WEBSOCKET_HOST "192.168.1.102"
 #define WEBSOCKET_PORT 8000
 #define WEBSOCKET_PATH "/api/device/ws/test_mac"
 #define NO_DATA_TIMEOUT_SEC 43200 // 30 Days
@@ -142,10 +142,10 @@ static camera_config_t camera_config = {
     .ledc_timer = LEDC_TIMER_0,
     .ledc_channel = LEDC_CHANNEL_0,
 
-    .pixel_format = PIXFORMAT_RGB565, //YUV422,GRAYSCALE,RGB565,JPEG
+    .pixel_format = PIXFORMAT_JPEG, //YUV422,GRAYSCALE,RGB565,JPEG
     .frame_size = FRAMESIZE_240X240,    //QQVGA-UXGA, For ESP32, do not use sizes above QVGA when not JPEG. The performance of the ESP32-S series has improved a lot, but JPEG mode always gives better frame rates.
 
-    .jpeg_quality = 40, //0-63, for OV series camera sensors, lower number means higher quality
+    .jpeg_quality = 25, //0-63, for OV series camera sensors, lower number means higher quality
     .fb_count = 1,       //When jpeg mode is used, if fb_count more than one, the driver will work in continuous mode.
     .fb_location = CAMERA_FB_IN_PSRAM,
     .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
@@ -413,25 +413,45 @@ static void camera_init_task(void* pvParameters){
             // 當 JPEG 的壓縮率太低時，會造成寫入溢出 FB-OVF，而當 FB-OVF 發生卻又沒有清除，造成 NO-EOI，並形成 recursive，最後發生 stack overflow
             // 後續補 merge request
             camera_fb_t* pic = esp_camera_fb_get();
-            // 補 Null 判斷
+            if(pic == NULL){
+                ESP_LOGE("Camera", "Take picture failed");
+                vTaskDelay(100 / portTICK_PERIOD_MS);
+                continue;
+            }
             ESP_LOGI("Camera", "Picture taken! Its size was: %zu bytes, width: %zu, height: %zu.", pic->len, pic->width, pic->height);
-            
-  
+
             // if websocket does't connected, and then release resouces and continues
             bool websocket_connected = esp_websocket_client_is_connected(websocket_client);
             if(websocket_connected){
 
-                // model inference
-                std::vector<std::vector<int>> bounding_boxes = model_inference_task(pic->buf, pic->width, pic->height, 3);
-                // convert image format
-                uint8_t* jpeg_buffer = NULL;
-                size_t jpeg_len = 0;
-                bool conversion_success = frame2jpg(pic, 40, &jpeg_buffer, &jpeg_len);
                 
+                // convert image format
+                size_t rgb_len = pic->height*pic->width*2;
+                uint8_t* rgb_buffer = (uint8_t*)malloc(rgb_len);
+                if(rgb_buffer == NULL){
+                    ESP_LOGE("Camera", "RGB Buffer allocate failed");
+                    esp_camera_fb_return(pic);
+                    continue;
+                }
+
+                bool conversion_success = jpg2rgb565(pic->buf, pic->len, rgb_buffer, JPG_SCALE_NONE);
+                // model inference
+                std::vector<std::vector<int>> bounding_boxes = model_inference_task(rgb_buffer, pic->width, pic->height, 3);
+                free(rgb_buffer);
+                rgb_buffer=NULL;
+
                 if(conversion_success){
+                    uint8_t* jpeg_buffer = (uint8_t*)malloc(pic->len+1);
+                    if(jpeg_buffer == NULL){
+                        ESP_LOGE("Camera", "JPEG Buffer allocate failed");
+                        esp_camera_fb_return(pic);
+                        continue;
+                    }
+                    memcpy(jpeg_buffer, pic->buf, pic->len);
+                    
                     websocket_sending_message_t msg = {0};
                     msg.type = 1;
-                    msg.image_len = jpeg_len;
+                    msg.image_len = pic->len;
                     msg.image_data = jpeg_buffer;
                     msg.bounding_boxes = std::move(bounding_boxes);
                     msg.action = ACTION_RETURN_INFERENCE;
@@ -921,7 +941,7 @@ static void sdmmc_card_init_task(){
 extern "C" void app_main(void){
     /**
      * 
-     * 將推論結果拆分傳輸
+     * 拍攝 JPEG 再轉 RGB565 進行推論
      * 
      */
     flash_init();
