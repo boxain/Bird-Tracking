@@ -170,7 +170,7 @@ static void cam_task(void *arg)
                         if (cam_obj->jpeg_mode) {
                             if (!cam_obj->psram_mode) {
                                 if (cam_obj->fb_size < (frame_buffer_event->len + pixels_per_dma)) {
-                                    ESP_LOGW(TAG, "猜測 FB-OVF");
+                                    ESP_LOGW(TAG, "FB-OVF");
                                     cnt--;
                                 } else {
                                     frame_buffer_event->len += ll_cam_memcpy(cam_obj,

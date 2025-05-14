@@ -32,29 +32,28 @@
 #include "esp_camera.h"
 #include "img_converters.h"
 #include "esp_http_client.h"
-// #include "image.hpp"
 #include "dl_tool.hpp"
 #include "human_face_detect_msr01.hpp"
 #include "human_face_detect_mnp01.hpp"
 
-/*
-    WIFI SETTING
-*/
+#include <wifi_provisioning/manager.h>
+#include <wifi_provisioning/scheme_softap.h>
+
+
+// WIFI SETTING
 #define EXAMPLE_ESP_WIFI_MAXIMUM_RETRY 5
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT BIT1
 static int s_retry_num = 0;
-
-/*
-    WEBSOCKET SETTING
-*/
-#define WEBSOCKET_HOST "192.168.1.102"
-#define WEBSOCKET_PORT 8000
-#define WEBSOCKET_PATH "/api/device/ws/test_mac"
-#define NO_DATA_TIMEOUT_SEC 43200 // 30 Days
-static esp_websocket_client_handle_t websocket_client;
 static EventGroupHandle_t s_wifi_event_group;
 
+// WEBSOCKET SETTING
+#define WEBSOCKET_HOST "192.168.1.102"
+#define WEBSOCKET_PORT 8000
+#define WEBSOCKET_PATH "/api/device/ws/6e837227-93b7-461b-bc73-caa9828b7f26"
+#define NO_DATA_TIMEOUT_SEC 43200 // 30 Days
+static char MAC[18];
+static esp_websocket_client_handle_t websocket_client;
 
 // WEBSOCKET TASK STATUS
 enum StatusType {
@@ -67,7 +66,9 @@ enum StatusType {
 enum ActionType {
     ACTION_START_INFERENCE,
     ACTION_STOP_INFERENCE,
-    ACTION_RETURN_INFERENCE
+    ACTION_RETURN_INFERENCE,
+    ACTION_MODE_SWITCH,
+    ACTION_LOG_INFO
 };
 
 // WEBSOCKET RECEIVED MESSAGE QUEUE
@@ -81,7 +82,7 @@ typedef struct {
 // WEBSOCKET SENDING MESSAGE QUEUE
 static QueueHandle_t  websocket_sending_message_queue;
 typedef struct {
-    bool type;     // 換成 opcode       
+    uint8_t op_code;     // 換成 opcode       
     ActionType action;
     uint8_t* image_data;
     size_t image_len;
@@ -89,16 +90,11 @@ typedef struct {
     StatusType status;
 } websocket_sending_message_t;
 
-
-/*
-    HTTP CLIENT
-*/
+// HTTP Client
 #define MAX_HTTP_RECV_BUFFER 512
 #define MAX_HTTP_OUTPUT_BUFFER 2048
 
-/*
-    CAMERA
-*/
+// Camera Setting
 #define CAM_PIN_PWDN 32
 #define CAM_PIN_RESET -1 //software reset will be performed
 #define CAM_PIN_XCLK 0
@@ -165,24 +161,33 @@ static esp_err_t init_camera(void)
 }
 #endif
 
-
-/*
-    SD CARD
-*/
-
+// SD Card Setting
 #define MAX_READING_CHAR 64
 #define MOUNT_POINT "/sdcard"
 
-
-/*
-    INFERENCE
-*/
+// Inference
 #define TWO_STAGE 0 /*<! 1: detect by two-stage which is more accurate but slower(with keypoints). */
                     /*<! 0: detect by one-stage which is less accurate but faster(without keypoints). */
 
-
 #define MIN(a,b) ((a) < (b) ? (a) : (b))
 
+
+/*
+    New Setting for switch mode
+    // 怎樣算是匿名宣告
+    // typedef 的意思
+    // static 的意思與儲存位置
+*/
+enum OperationModeType {
+    CONTINUOUS_MODE,
+    STAND_BY_MODE,
+    DEEP_SLEEP_MODE
+};
+static OperationModeType operation_mode = STAND_BY_MODE;
+static EventGroupHandle_t g_system_event_group;
+static SemaphoreHandle_t g_mode_mutex;
+#define EVT_GRP__BIT_CONTINUOUS_MODE_ACTIVE BIT0
+#define EVT_GRP__BIT_TRIGGER_SINGLE_SHOT BIT1
 
 
 static std::vector<std::vector<int>> model_inference_task(uint8_t* image, uint8_t width, uint8_t height, uint8_t channel){
@@ -224,14 +229,17 @@ static std::vector<std::vector<int>> model_inference_task(uint8_t* image, uint8_
 }
 
 
+
 static char* action_enum_to_string(ActionType action){
     switch (action) {
         case ACTION_START_INFERENCE: return "START_INFERENCE";
         case ACTION_STOP_INFERENCE: return"STOP_INFERENCE";
         case ACTION_RETURN_INFERENCE: return "INFERENCE_RESULT";
+        case ACTION_MODE_SWITCH: return "MODE_SWITCH";
         default: return "UNKNOWN_ACTION";   
     }
 }
+
 
 
 static char* status_enum_to_string(StatusType status){
@@ -242,6 +250,7 @@ static char* status_enum_to_string(StatusType status){
         default: return "UNKNOWN_STATUS";
     }
 }
+
 
 
 static char* inference_message2json(ActionType action, StatusType status, std::vector<std::vector<int>> bounding_boxes){
@@ -277,6 +286,7 @@ static char* inference_message2json(ActionType action, StatusType status, std::v
 }
 
 
+
 static char* control_message2json(ActionType action, StatusType status){
     char* action_str = action_enum_to_string(action);
     char* status_str = status_enum_to_string(status);
@@ -291,15 +301,16 @@ static char* control_message2json(ActionType action, StatusType status){
 }
 
 
+
 static void websocket_sending_task(void* pvParameters){
     websocket_sending_message_t msg;
     while(1){
         // Consider add thread block
         if(xQueueReceive(websocket_sending_message_queue, &msg, portMAX_DELAY) == pdTRUE){
-            ESP_LOGI("Websocket Sending Task", "Sending message (type: %d)", msg.type);
+            ESP_LOGI("Websocket Sending Task", "Sending message (type: %d)", msg.op_code);
             
             // If is Control Message
-            if(msg.type == 0){
+            if(msg.op_code == 0x01){
 
                 char* serialized_message = control_message2json(msg.action, msg.status);
                 if(serialized_message != NULL){
@@ -314,11 +325,14 @@ static void websocket_sending_task(void* pvParameters){
                 // int64_t send_start = esp_timer_get_time();
 
                 char* serialized_message = inference_message2json(msg.action, msg.status, msg.bounding_boxes);
-                if(serialized_message != NULL) {
+                if(serialized_message == NULL){
+                    free(msg.image_data);
+                }else{
+                    esp_websocket_client_send_bin(websocket_client,(char*)msg.image_data, msg.image_len, portMAX_DELAY);
+                    free(msg.image_data);
                     int len = strlen(serialized_message);
                     esp_websocket_client_send_text(websocket_client, serialized_message, len, portMAX_DELAY);
                     free(serialized_message);
-                    esp_websocket_client_send_bin(websocket_client,(char*)msg.image_data, msg.image_len, portMAX_DELAY);
                 }
                 // int64_t send_end = esp_timer_get_time();
                 // int64_t sending_time = (send_end - send_start)/1000;
@@ -334,11 +348,30 @@ static void websocket_sending_task(void* pvParameters){
                 // }else {
                 //     ESP_LOGW("Websocket Sending Task", "sending binary failed");
                 // }
-                free(msg.image_data);
             }
         }            
     }
 }
+
+
+
+static void mode_switch(char* mode){
+    if(xSemaphoreTake(g_mode_mutex, portMAX_DELAY) == pdTRUE ){   
+        if(strcmp(mode, "CONTINUOUS_MODE") == 0){
+            operation_mode = CONTINUOUS_MODE;
+            xEventGroupSetBits(g_system_event_group, EVT_GRP__BIT_CONTINUOUS_MODE_ACTIVE);
+
+        }else if(strcmp(mode, "STAND_BY_MODE") == 0){
+            operation_mode = STAND_BY_MODE;
+            xEventGroupClearBits(g_system_event_group, EVT_GRP__BIT_CONTINUOUS_MODE_ACTIVE);
+            xEventGroupClearBits(g_system_event_group, EVT_GRP__BIT_TRIGGER_SINGLE_SHOT);
+        }
+
+        xSemaphoreGive(g_mode_mutex);
+        ESP_LOGI("MODEL SWITCH", "Switch complete");
+    }
+}
+
 
 
 static void websocket_process_task(void* pvParameters){
@@ -361,25 +394,27 @@ static void websocket_process_task(void* pvParameters){
                     cJSON* action = cJSON_GetObjectItem(msg_json, "action");
                     if(action && cJSON_IsString(action)) {
                         ESP_LOGI("Websocket", "Task: %s", action->valuestring);
-                        // char* action_printed = cJSON_Print(action);
-                        // int action_printed_len = strlen(action_printed);
-
-                        // websocket_sending_message_t sending_msg = {0};
-                        // sending_msg.text_data = (char*)malloc(action_printed_len+1); 
-        
-                        // if(sending_msg.text_data == NULL){
-                        //     ESP_LOGE("Websocket", "Fail to allocate websocket sending message data");
-                        //     free(sending_msg.text_data);
-                        // }else{
-                            
-                        //     strcpy(sending_msg.text_data, action_printed);
-                        //     sending_msg.op_code = 0x01;
-                        //     sending_msg.data_len = action_printed_len;
-                        //     sending_msg.status = RECEIVED;
-                        //     xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
+                        websocket_sending_message_t sending_msg = {0};
                         
-                        // }
-                        // free(action_printed);
+                        if(strcmp(action->valuestring, "MODE_SWITCH") == 0){
+                            cJSON* mode = cJSON_GetObjectItem(msg_json, "mode");
+                            if(mode == NULL){
+                                ESP_LOGW("Websocket", "Invalid task name");
+                            }else{
+                                // Send received notification, if using MQTT protocal does not do it.
+                                sending_msg.action = ACTION_MODE_SWITCH;
+                                sending_msg.status = STATUS_RECEIVED;
+                                sending_msg.op_code = 0x01;
+                                xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
+                                mode_switch(mode->valuestring);
+                            }
+
+                        }else if(strcmp(action->valuestring, "INFERENCE") == 0){
+                            xEventGroupSetBits(g_system_event_group, EVT_GRP__BIT_TRIGGER_SINGLE_SHOT);
+
+                        }else{
+                            ESP_LOGW("Websocket", "Invalid task name");
+                        }
                         
                     }else{
                         ESP_LOGE("Websocket", "Message isn't right format");
@@ -398,119 +433,125 @@ static void websocket_process_task(void* pvParameters){
 }
 
 
-static void camera_init_task(void* pvParameters){
-    #if ESP_CAMERA_SUPPORTED
-        if(ESP_OK != init_camera()){
-            vTaskDelete(NULL);
+
+static void take_picture(){
+    ESP_LOGI("Camera", "Taking picture...");
+    // 當 JPEG 的壓縮率太低時，會造成寫入溢出 FB-OVF，而當 FB-OVF 發生卻又沒有清除，造成 NO-EOI，並形成 recursive，最後發生 stack overflow
+    camera_fb_t* pic = esp_camera_fb_get();
+    if(pic == NULL){
+        ESP_LOGE("Camera", "Take picture failed");
+        return;
+    }
+    
+    ESP_LOGI("Camera", "Picture taken! Its size was: %zu bytes, width: %zu, height: %zu.", pic->len, pic->width, pic->height);
+
+    // if websocket does't connected, and then release resouces and continues
+    bool websocket_connected = esp_websocket_client_is_connected(websocket_client);
+    if(!websocket_connected){
+        ESP_LOGE("Websocket", "Websocket doesn't connected.");
+        esp_camera_fb_return(pic);
+        return;
+    }
+
+    // allocate heap for RGB565 format, if failed to allocate, released resources and continues
+    size_t rgb_len = pic->height*pic->width*2;
+    uint8_t* rgb_buffer = (uint8_t*)malloc(rgb_len);
+    if(rgb_buffer == NULL){
+        ESP_LOGE("Camera", "RGB Buffer allocate failed");
+        esp_camera_fb_return(pic);
+        return;
+    }
+
+    // convert image format from JPEG to RGB565, if failed convert, released resources and continues
+    bool conversion_success = jpg2rgb565(pic->buf, pic->len, rgb_buffer, JPG_SCALE_NONE);
+    if(!conversion_success){
+        ESP_LOGE("Camera", "Image converstion failed.");
+        free(rgb_buffer);
+        esp_camera_fb_return(pic);
+        rgb_buffer=NULL;
+        return;
+    }
+
+    // model inference, when inference completed, release memory about RGB565
+    std::vector<std::vector<int>> bounding_boxes = model_inference_task(rgb_buffer, pic->width, pic->height, 3);
+    free(rgb_buffer);
+    rgb_buffer=NULL;
+
+
+    // allocate heap for JPEG buffer, in oder to avoid null pointer reference in websocket_sending_message_queue
+    // if failed, released reousrces
+    uint8_t* jpeg_buffer = (uint8_t*)malloc(pic->len+1);
+    if(jpeg_buffer == NULL){
+        ESP_LOGE("Camera", "JPEG Buffer allocate failed");
+        esp_camera_fb_return(pic);
+        return;
+    }
+
+    // memory copy
+    memcpy(jpeg_buffer, pic->buf, pic->len);
+
+    // prepare sending message struct
+    websocket_sending_message_t msg = {0};
+    msg.op_code = 0x02;
+    msg.image_len = pic->len;
+    msg.image_data = jpeg_buffer;
+    msg.bounding_boxes = std::move(bounding_boxes);
+    msg.action = ACTION_RETURN_INFERENCE;
+    msg.status = STATUS_COMPLETED;
+    BaseType_t send_result = xQueueSend(websocket_sending_message_queue, &msg, 0);
+
+    if( send_result != pdPASS ){
+        free(jpeg_buffer);
+        jpeg_buffer = NULL;
+    }
+
+    esp_camera_fb_return(pic);
+}
+
+
+
+static void camera_control_task(void* pvParameters){
+    if(ESP_OK != init_camera()){
+        ESP_LOGE("Camera", "INIT failed");
+        vTaskDelete(NULL);
+    }
+
+    while(1) {
+        OperationModeType local_mode = STAND_BY_MODE;
+        if(xSemaphoreTake(g_mode_mutex, portMAX_DELAY) == pdTRUE){
+            local_mode = operation_mode;
+            xSemaphoreGive(g_mode_mutex);
         }
 
-        // --- FPS counter ---
-        uint32_t frame_count = 0;
-        int64_t last_fps_time = esp_timer_get_time();
-
-        while(1) {
-            ESP_LOGI("Camera", "Taking picture...");
-
-            // 當 JPEG 的壓縮率太低時，會造成寫入溢出 FB-OVF，而當 FB-OVF 發生卻又沒有清除，造成 NO-EOI，並形成 recursive，最後發生 stack overflow
-            camera_fb_t* pic = esp_camera_fb_get();
-            if(pic == NULL){
-                ESP_LOGE("Camera", "Take picture failed");
-                vTaskDelay(100 / portTICK_PERIOD_MS);
-                continue;
+        if(local_mode == CONTINUOUS_MODE){
+            ESP_LOGI("Camera", "Continuous mode trigger");
+            EventBits_t bits = xEventGroupGetBits(g_system_event_group);
+            if(bits & EVT_GRP__BIT_CONTINUOUS_MODE_ACTIVE){
+                take_picture();
+                vTaskDelay(10000 / portTICK_PERIOD_MS);
+            }else{
+                vTaskDelay(50);
             }
             
-            ESP_LOGI("Camera", "Picture taken! Its size was: %zu bytes, width: %zu, height: %zu.", pic->len, pic->width, pic->height);
+        }else if (local_mode == STAND_BY_MODE){
+            ESP_LOGI("Camera", "Stand by mode trigger");
+            EventBits_t bits = xEventGroupWaitBits(
+                g_system_event_group,
+                EVT_GRP__BIT_CONTINUOUS_MODE_ACTIVE | EVT_GRP__BIT_TRIGGER_SINGLE_SHOT,
+                pdFALSE, 
+                pdFALSE,
+                portMAX_DELAY
+            );
 
-            // if websocket does't connected, and then release resouces and continues
-            bool websocket_connected = esp_websocket_client_is_connected(websocket_client);
-            if(!websocket_connected){
-                ESP_LOGE("Websocket", "Websocket doesn't connected.");
-                esp_camera_fb_return(pic);
-                continue;
+            if(bits & EVT_GRP__BIT_TRIGGER_SINGLE_SHOT){
+                take_picture();
+                xEventGroupClearBits(g_system_event_group, EVT_GRP__BIT_TRIGGER_SINGLE_SHOT);
             }
-
-            // allocate heap for RGB565 format, if failed to allocate, released resources and continues
-            size_t rgb_len = pic->height*pic->width*2;
-            uint8_t* rgb_buffer = (uint8_t*)malloc(rgb_len);
-            if(rgb_buffer == NULL){
-                ESP_LOGE("Camera", "RGB Buffer allocate failed");
-                esp_camera_fb_return(pic);
-                continue;
-            }
-
-            // convert image format from JPEG to RGB565, if failed convert, released resources and continues
-            bool conversion_success = jpg2rgb565(pic->buf, pic->len, rgb_buffer, JPG_SCALE_NONE);
-            if(!conversion_success){
-                ESP_LOGE("Camera", "Image converstion failed.");
-                free(rgb_buffer);
-                esp_camera_fb_return(pic);
-                rgb_buffer=NULL;
-                continue;
-            }
-
-            // model inference, when inference completed, release memory about RGB565
-            std::vector<std::vector<int>> bounding_boxes = model_inference_task(rgb_buffer, pic->width, pic->height, 3);
-            free(rgb_buffer);
-            rgb_buffer=NULL;
-
-
-            // allocate heap for JPEG buffer, in oder to avoid null pointer reference in websocket_sending_message_queue
-            // if failed, released reousrces
-            uint8_t* jpeg_buffer = (uint8_t*)malloc(pic->len+1);
-            if(jpeg_buffer == NULL){
-                ESP_LOGE("Camera", "JPEG Buffer allocate failed");
-                esp_camera_fb_return(pic);
-                continue;
-            }
-
-            // memory copy
-            memcpy(jpeg_buffer, pic->buf, pic->len);
-
-            // prepare sending message struct
-            websocket_sending_message_t msg = {0};
-            msg.type = 1;
-            msg.image_len = pic->len;
-            msg.image_data = jpeg_buffer;
-            msg.bounding_boxes = std::move(bounding_boxes);
-            msg.action = ACTION_RETURN_INFERENCE;
-            msg.status = STATUS_COMPLETED;
-
-            // --- Measure Queue sending cost time
-            int64_t queue_start_time = esp_timer_get_time();
-            BaseType_t send_result = xQueueSend(websocket_sending_message_queue, &msg, 0);
-            int64_t queue_end_time = esp_timer_get_time();
-            int64_t queue_cost = queue_end_time - queue_start_time;
-
-            if( send_result == pdPASS ){
-                frame_count++;
-                ESP_LOGI("FPS", "Queue sending cost: %lld millseconds", queue_cost / 1000);
-            }else{
-                free(jpeg_buffer);
-                jpeg_buffer = NULL;
-            }
-    
-            esp_camera_fb_return(pic);
-
-            // Measure FPS & Sending Queue spaces
-            int64_t now  = esp_timer_get_time();
-            int64_t elapsed_us = now - last_fps_time;
-            if (elapsed_us >= 5000000) {
-                float fps = (float) frame_count / (elapsed_us / 1000000.0f);
-                ESP_LOGI("FPS", "Average FPS over last %lld ms: %.2f", elapsed_us / 1000, fps);
-                frame_count = 0;
-                last_fps_time = now;
-
-                UBaseType_t remain_queue = uxQueueSpacesAvailable(websocket_sending_message_queue);
-                ESP_LOGI("Sending Queue", "Sending queue spaces remaining: %d", remain_queue);
-
-            }
-            // vTaskDelay(3000 / portTICK_PERIOD_MS);
         }
-    #else
-        ESP_LOGE("Camera", "Camera support is not available for this chip");
-        return;
-    #endif
+
+    }
 }
+
 
 
 static void log_error_if_nonzero(const char *message, int error_code){
@@ -518,6 +559,7 @@ static void log_error_if_nonzero(const char *message, int error_code){
         ESP_LOGE("Websocket", "Last error %s: 0x%x", message, error_code);
     }
 }
+
 
   
 static void websocket_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void* event_data){
@@ -588,13 +630,18 @@ static void websocket_handler(void *handler_args, esp_event_base_t base, int32_t
 }
 
 
+
 static void websocket_init_task(){
 
     // Setting Websockt config
+    char websocket_path[70];
+    snprintf(websocket_path, size_t(websocket_path), "%s/%s", WEBSOCKET_PATH, MAC);
+    ESP_LOGI("Websocket", "Path: %s", websocket_path);
+
     esp_websocket_client_config_t websocket_cfg = {};
     websocket_cfg.host = WEBSOCKET_HOST;
     websocket_cfg.port = WEBSOCKET_PORT;
-    websocket_cfg.path = WEBSOCKET_PATH;
+    websocket_cfg.path = websocket_path;
     websocket_cfg.disable_auto_reconnect = false;
 
     // Init Websocket client
@@ -617,116 +664,26 @@ static void websocket_init_task(){
         vTaskDelete(NULL);
     }
 
+    // Create RTOS event group and semaphore
+    g_system_event_group = xEventGroupCreate();
+    g_mode_mutex = xSemaphoreCreateBinary();
+
+    if(g_mode_mutex == NULL){
+        ESP_LOGE("Semahore", "create failed...");
+    }else{
+        xSemaphoreGive(g_mode_mutex);
+    }
+
+    if(g_system_event_group == NULL){
+        ESP_LOGE("Event Group", "create failed...");
+    }
+
     // Create websocket process task
     xTaskCreatePinnedToCore(websocket_process_task,"Websocket process task", 2048, NULL, 6, NULL, tskNO_AFFINITY);
     xTaskCreatePinnedToCore(websocket_sending_task, "Websocket sending task", 4096, NULL, 6, NULL, tskNO_AFFINITY);
-    xTaskCreatePinnedToCore(camera_init_task, "Camera init", 4096, NULL, 2, NULL, tskNO_AFFINITY);
-    
+    xTaskCreatePinnedToCore(camera_control_task, "Camera control task", 4096, NULL, 2, NULL, tskNO_AFFINITY);
 }
 
-
-static void flash_init(){
-    esp_err_t ret = nvs_flash_init();
-    if(ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
-}
-
-
-static void wifi_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data){
-    
-    if(event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START){
-        esp_wifi_connect();
-        // init websocket
-    } else if(event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        // clear websocket resource
-        if(s_retry_num < EXAMPLE_ESP_WIFI_MAXIMUM_RETRY){
-            esp_wifi_connect();
-            s_retry_num++;
-            printf("Wifi station retry to connect to the AP.\n");
-        }else{
-            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-        }
-        printf("Wifi station connect to the AP fail.\n");
-    
-    } else if(event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t* event = (ip_event_got_ip_t*)event_data;
-        ESP_LOGI("Wifi station", "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
-        s_retry_num = 0;
-        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-    }
-
-}
-
-
-static void wifi_init_task(){
-    // step 1.
-    s_wifi_event_group = xEventGroupCreate();
-    ESP_ERROR_CHECK(esp_netif_init());                     // create netif
-    ESP_ERROR_CHECK(esp_event_loop_create_default());      // create event_loop for event_handle
-    
-    // step 2. 
-    esp_netif_create_default_wifi_sta();                   // create abstract esp_netif_t instance
-    
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();   // init WiFi driver
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    esp_event_handler_instance_t instance_any_id;
-    esp_event_handler_instance_t instance_got_ip;
-
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(   // register event_handler
-        WIFI_EVENT,
-        ESP_EVENT_ANY_ID,
-        &wifi_handler,
-        NULL,
-        &instance_any_id
-    ));
-
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        IP_EVENT,
-        IP_EVENT_STA_GOT_IP,
-        &wifi_handler,
-        NULL,
-        &instance_got_ip
-    ));
-
-    
-    printf("WiFi SSID: %s, PASSWORD: %s", CONFIG_ESP_WIFI_SSID, CONFIG_ESP_WIFI_PASSWORD);
-
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = CONFIG_ESP_WIFI_SSID,
-            .password = CONFIG_ESP_WIFI_PASSWORD,
-        }
-    };
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));                 // setting WiFi driver
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));   // setting WiFi driver
-    ESP_ERROR_CHECK(esp_wifi_start());                                 // start WiFi driver
-
-
-    EventBits_t bits = xEventGroupWaitBits(
-        s_wifi_event_group,
-        WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-        pdFALSE,
-        pdFALSE,
-        portMAX_DELAY
-    );
-
-    if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI("Wifi station", "connected to ap SSID:%s password:%s", CONFIG_ESP_WIFI_SSID, CONFIG_ESP_WIFI_PASSWORD);
-        websocket_init_task();
-    } else if(bits & WIFI_FAIL_BIT) {
-        ESP_LOGI("Wifi station", "Failed to connect to SSID:%s, password:%s",
-            CONFIG_ESP_WIFI_SSID, CONFIG_ESP_WIFI_PASSWORD);
-    } else{
-        ESP_LOGE("Wifi station", "UNEXPECTED EVENT");
-    }
-
-}
 
 
 static esp_err_t sdmmc_card_write_file(const char* path, char* data){
@@ -744,6 +701,7 @@ static esp_err_t sdmmc_card_write_file(const char* path, char* data){
 
     return ESP_OK;
 }
+
 
 
 static esp_err_t sdmmc_card_read_file(const char* path){
@@ -767,6 +725,7 @@ static esp_err_t sdmmc_card_read_file(const char* path){
     
     return ESP_OK;
 }
+
 
 
 static void sdmmc_card_init_task(){
@@ -949,13 +908,218 @@ static void sdmmc_card_init_task(){
 }
 
 
+
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+    if(event_base == WIFI_PROV_EVENT){
+
+        switch(event_id){
+            case WIFI_PROV_START:{
+                ESP_LOGI("WIFI_PROV Event", "Provisioning started");
+                break;
+
+            }case WIFI_PROV_CRED_RECV: {
+                wifi_sta_config_t* wifi_sta_config = (wifi_sta_config_t*)event_data;
+                ESP_LOGI("WIFI_PROV Event", "Received Wi-Fi credentials"
+                    "\n\tSSID     : %s\n\tPassword : %s",
+                    (const char *) wifi_sta_config->ssid,
+                    (const char *) wifi_sta_config->password);
+                break;
+
+            }case WIFI_PROV_CRED_FAIL: {
+                wifi_prov_sta_fail_reason_t *reason = (wifi_prov_sta_fail_reason_t*)event_data;
+                ESP_LOGE("WIFI_PROV Event", "Provisioning failed!\n\tReason : %s"
+                    "\n\tPlease reset to factory and retry provisioning",
+                    (*reason == WIFI_PROV_STA_AUTH_ERROR) ?
+                    "Wi-Fi station authentication failed" : "Wi-Fi access-point not found");
+                
+                // Retry
+                break;
+            
+            }case WIFI_PROV_CRED_SUCCESS: {
+                ESP_LOGI("WIFI_PROV Event", "{rpvisioning successful}");
+                break;
+            
+            }case WIFI_PROV_END: {
+                wifi_prov_mgr_deinit();
+            }
+
+        }
+    
+    }else if(event_base == WIFI_EVENT) {
+
+        switch (event_id){
+            case WIFI_EVENT_STA_START: {
+                esp_wifi_connect();          
+                break;
+            
+            }case WIFI_EVENT_STA_DISCONNECTED: {
+                if(s_retry_num < EXAMPLE_ESP_WIFI_MAXIMUM_RETRY){
+                    ESP_LOGI("WIFI Event", "Disconnected. Connecting to the AP again... \n");
+                    s_retry_num++;
+                    esp_wifi_connect();
+                }else{
+                    xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+                }
+                ESP_LOGI("WIFI", "Wifi station connect to the AP fail.\n");
+            
+            }case WIFI_EVENT_AP_STACONNECTED: {
+                ESP_LOGI("WIFI Event", "SoftAP transport: Connected!");
+                break;
+            
+            }case WIFI_EVENT_AP_STADISCONNECTED: {
+                ESP_LOGI("WIFI Event", "SoftAP transport: Disconnected!");
+                break;
+            }
+        }
+    
+    }else if(event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP ) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*)event_data;
+        ESP_LOGI("IP Event", "Got ip:" IPSTR, IP2STR(&event->ip_info.ip));
+        s_retry_num = 0;
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    
+    }else if(event_base == PROTOCOMM_SECURITY_SESSION_EVENT) {
+        switch(event_id){
+            case PROTOCOMM_SECURITY_SESSION_SETUP_OK: {
+                ESP_LOGI("Security Event", "Secured session established!");
+                break;
+            }
+            case PROTOCOMM_SECURITY_SESSION_INVALID_SECURITY_PARAMS: {
+                ESP_LOGI("Security Event", "Received invalid secrity parameters for establishing secure session!");
+                break;
+            
+            }case PROTOCOMM_SECURITY_SESSION_CREDENTIALS_MISMATCH: {
+                ESP_LOGI("Security Event", "Received incorrect username and/or Pop for establishing secure session!");
+                break;
+
+            }default:
+                break;
+        }
+
+    }
+}
+
+
+
+static void get_device_service_name(char* service_name, size_t max){
+    uint8_t eth_mac[6];
+    const char *ssid_prefix = "PROV_";
+    esp_wifi_get_mac(WIFI_IF_STA, eth_mac);
+    snprintf(service_name, max, "%s%02X%02X%02X", ssid_prefix, eth_mac[3], eth_mac[4], eth_mac[5]);
+}
+
+
+
+esp_err_t custom_prov_data_handler(uint32_t session_id, const uint8_t* inbuf, ssize_t inlen, uint8_t** outbuf, ssize_t* outlen, void* priv_data){
+    if (inbuf){
+        ESP_LOGI("WIFI_PROV", "Received data: %.*s", inlen, (char*)inbuf);
+    }
+
+    char response[] = "SUCCESS";
+    *outbuf = (uint8_t*)strdup(response);
+    if(*outbuf == NULL){
+        ESP_LOGE("WIFI_PROV", "Response out of memory");
+        return ESP_ERR_NO_MEM;
+    }
+    *outlen = strlen(response)+1;
+    return ESP_OK;
+}
+
+
+
+void wifi_init_task(){
+    s_wifi_event_group = xEventGroupCreate();
+    ESP_ERROR_CHECK(esp_netif_init());                     // create netif to init TCP/IP stack
+    ESP_ERROR_CHECK(esp_event_loop_create_default());      // create event_loop for event_handle
+
+    // Register Different type of Event
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_PROV_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(PROTOCOMM_SECURITY_SESSION_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+
+    esp_netif_create_default_wifi_sta();                  // create abstract esp_netif_t sta instance
+    esp_netif_create_default_wifi_ap();                   // create abstract esp_netif_t softap instance
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    wifi_prov_mgr_config_t config = {
+        .scheme = wifi_prov_scheme_softap
+    };
+
+    ESP_ERROR_CHECK(wifi_prov_mgr_init(config));
+    bool provisioned = false;
+    ESP_ERROR_CHECK(wifi_prov_mgr_is_provisioned(&provisioned));   // Check if wifi credential has been stored in NVS
+
+    if(!provisioned){
+        ESP_LOGI("WIFI_PROV", "Starting provisioning");
+
+        char service_name[12];
+        get_device_service_name(service_name, sizeof(service_name));  // Fetch WiFi SSID
+
+
+        wifi_prov_security_t secuirty = WIFI_PROV_SECURITY_1;        
+        const char* pop = CONFIG_ESP_WIFI_POP;
+        wifi_prov_security1_params_t* sec_params = pop;
+        const char* service_key = CONFIG_ESP_WIFI_PASSWORD;
+
+        /* Start provisioning service */
+        ESP_ERROR_CHECK(wifi_prov_mgr_start_provisioning(secuirty, (const void*)sec_params, service_name, service_key));
+        wifi_prov_mgr_endpoint_register("custom-data", custom_prov_data_handler, NULL);         // Setting Custom Data
+
+    }else{
+        ESP_LOGI("WIFI_PROV", "Already provisioned, starting Wi-Fi STA");
+        wifi_prov_mgr_deinit();
+        
+        ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+        ESP_ERROR_CHECK(esp_wifi_start());
+    }
+
+    EventBits_t bits = xEventGroupWaitBits(
+        s_wifi_event_group,
+        WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+        pdFALSE,
+        pdFALSE,
+        portMAX_DELAY
+    );
+
+    if (bits & WIFI_CONNECTED_BIT) {
+        uint8_t mac[6];
+        esp_err_t err = esp_efuse_mac_get_default(mac);
+        if(err != ESP_OK){
+            ESP_LOGE("MAC", "Get Mac address failed\n");
+        }else{
+            snprintf(MAC, sizeof(MAC), "%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+            ESP_LOGI("MAC", "MAC Address is: %s", MAC);
+            websocket_init_task();
+        }
+        
+    }
+}
+
+
+
+static void nvs_init(){
+    esp_err_t ret = nvs_flash_init();
+    if(ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+}
+
+
+
 extern "C" void app_main(void){
     /**
      * 
-     * 完成 OTA
+     * 1. 完成不同 mode 的省電設置
+     * 2. 完成 OTA
+     * 3. 完成在 ESP32-S3 的 Model Deployment
+     * 4. Websocket reconnected
      * 
      */
-    flash_init();
-    // sdmmc_card_init_task();
+    nvs_init();
     wifi_init_task();
+    
 }
