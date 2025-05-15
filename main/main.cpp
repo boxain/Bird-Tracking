@@ -39,6 +39,8 @@
 #include <wifi_provisioning/manager.h>
 #include <wifi_provisioning/scheme_softap.h>
 
+#include "esp_pm.h"
+
 
 // WIFI SETTING
 #define EXAMPLE_ESP_WIFI_MAXIMUM_RETRY 5
@@ -48,7 +50,7 @@ static int s_retry_num = 0;
 static EventGroupHandle_t s_wifi_event_group;
 
 // WEBSOCKET SETTING
-#define WEBSOCKET_HOST "192.168.1.102"
+#define WEBSOCKET_HOST "192.168.1.100"
 #define WEBSOCKET_PORT 8000
 #define WEBSOCKET_PATH "/api/device/ws/6e837227-93b7-461b-bc73-caa9828b7f26"
 #define NO_DATA_TIMEOUT_SEC 43200 // 30 Days
@@ -169,15 +171,7 @@ static esp_err_t init_camera(void)
 #define TWO_STAGE 0 /*<! 1: detect by two-stage which is more accurate but slower(with keypoints). */
                     /*<! 0: detect by one-stage which is less accurate but faster(without keypoints). */
 
-#define MIN(a,b) ((a) < (b) ? (a) : (b))
-
-
-/*
-    New Setting for switch mode
-    // 怎樣算是匿名宣告
-    // typedef 的意思
-    // static 的意思與儲存位置
-*/
+// Mode switch
 enum OperationModeType {
     CONTINUOUS_MODE,
     STAND_BY_MODE,
@@ -188,6 +182,11 @@ static EventGroupHandle_t g_system_event_group;
 static SemaphoreHandle_t g_mode_mutex;
 #define EVT_GRP__BIT_CONTINUOUS_MODE_ACTIVE BIT0
 #define EVT_GRP__BIT_TRIGGER_SINGLE_SHOT BIT1
+
+// Power saving
+esp_pm_config_t pm_config;
+esp_pm_lock_handle_t max_cpu_mz;
+esp_pm_lock_handle_t max_apb_mz;
 
 
 static std::vector<std::vector<int>> model_inference_task(uint8_t* image, uint8_t width, uint8_t height, uint8_t channel){
@@ -355,14 +354,44 @@ static void websocket_sending_task(void* pvParameters){
 
 
 
+static void acquire_pm_lock(){
+    esp_err_t res = esp_pm_lock_acquire(max_cpu_mz);
+    if(res != ESP_OK){
+        ESP_LOGW("PM", "Max cpu lock acquire failed.");
+    }
+    res = esp_pm_lock_acquire(max_apb_mz);
+    if(res != ESP_OK){
+        ESP_LOGW("PM", "Max apb lock acquire failed.");
+    }
+    ESP_LOGI("PM", "Fetch all acquire lock");
+}
+
+
+
+static void release_pm_lock(){
+    esp_err_t res = esp_pm_lock_release(max_cpu_mz);
+    if(res != ESP_OK){
+        ESP_LOGW("PM", "Max cpu lock release failed.");
+    }
+    res = esp_pm_lock_release(max_apb_mz);
+    if(res != ESP_OK){
+        ESP_LOGW("PM", "Max apb lock release failed.");
+    }
+    ESP_LOGI("PM", "Release all acquire lock");
+}
+
+
+
 static void mode_switch(char* mode){
     if(xSemaphoreTake(g_mode_mutex, portMAX_DELAY) == pdTRUE ){   
         if(strcmp(mode, "CONTINUOUS_MODE") == 0){
             operation_mode = CONTINUOUS_MODE;
+            acquire_pm_lock();
             xEventGroupSetBits(g_system_event_group, EVT_GRP__BIT_CONTINUOUS_MODE_ACTIVE);
 
         }else if(strcmp(mode, "STAND_BY_MODE") == 0){
             operation_mode = STAND_BY_MODE;
+            release_pm_lock();
             xEventGroupClearBits(g_system_event_group, EVT_GRP__BIT_CONTINUOUS_MODE_ACTIVE);
             xEventGroupClearBits(g_system_event_group, EVT_GRP__BIT_TRIGGER_SINGLE_SHOT);
         }
@@ -1110,15 +1139,38 @@ static void nvs_init(){
 
 
 
+static void power_management_init(){
+    pm_config = {
+        .max_freq_mhz = 240,
+        .min_freq_mhz = 40,
+        .light_sleep_enable = false
+    };
+    ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
+
+    esp_err_t res = esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "Continuous mode cpu pm lock", &max_cpu_mz);
+    if(res != ESP_OK){
+        ESP_LOGW("PM", "Max cpu lock create failed.");
+        return;
+    }
+
+    res = esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "Continuous mode apb pm lock", &max_apb_mz);
+    if(res != ESP_OK){
+        ESP_LOGW("PM", "Max apb lock create failed.");
+        return;
+    }
+}
+
+
+
 extern "C" void app_main(void){
     /**
      * 
-     * 1. 完成不同 mode 的省電設置
-     * 2. 完成 OTA
-     * 3. 完成在 ESP32-S3 的 Model Deployment
-     * 4. Websocket reconnected
+     * 1. 完成 OTA
+     * 2. 完成在 ESP32-S3 的 Model Deployment
+     * 3. Websocket reconnected
      * 
      */
+    power_management_init();
     nvs_init();
     wifi_init_task();
     
