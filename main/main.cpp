@@ -1,22 +1,23 @@
 #include <string.h>
 #include <stdio.h>
+#include <cJSON.h>
 
-#include "sdkconfig.h"
 #include "freertos/FreeRTOS.h" 
 #include "freertos/task.h"            
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h" 
 
+#include "sdkconfig.h"
 #include "esp_chip_info.h"
+#include "esp_pm.h"
 #include "esp_mac.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
-#include "esp_websocket_client.h"
+
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "esp_timer.h"
-
 #include <sys/unistd.h>
 #include <sys/stat.h>
 #include "esp_vfs_fat.h"
@@ -26,9 +27,10 @@
 #if SOC_SDMMC_IO_POWER_EXTERNAL
 #include "sd_pwr_ctrl_by_on_chip_ldo.h"
 #endif
+#include <wifi_provisioning/manager.h>
+#include <wifi_provisioning/scheme_softap.h>
 
-#include <cJSON.h>
-
+#include "esp_websocket_client.h"
 #include "esp_camera.h"
 #include "img_converters.h"
 #include "esp_http_client.h"
@@ -36,10 +38,9 @@
 #include "human_face_detect_msr01.hpp"
 #include "human_face_detect_mnp01.hpp"
 
-#include <wifi_provisioning/manager.h>
-#include <wifi_provisioning/scheme_softap.h>
-
-#include "esp_pm.h"
+#include "esp_ota_ops.h"
+#include "esp_http_client.h"
+#include "esp_https_ota.h"
 
 
 // WIFI SETTING
@@ -50,7 +51,7 @@ static int s_retry_num = 0;
 static EventGroupHandle_t s_wifi_event_group;
 
 // WEBSOCKET SETTING
-#define WEBSOCKET_HOST "192.168.1.100"
+#define WEBSOCKET_HOST "192.168.1.102"
 #define WEBSOCKET_PORT 8000
 #define WEBSOCKET_PATH "/api/device/ws/6e837227-93b7-461b-bc73-caa9828b7f26"
 #define NO_DATA_TIMEOUT_SEC 43200 // 30 Days
@@ -70,6 +71,7 @@ enum ActionType {
     ACTION_STOP_INFERENCE,
     ACTION_RETURN_INFERENCE,
     ACTION_MODE_SWITCH,
+    ACTION_OTA,
     ACTION_LOG_INFO
 };
 
@@ -182,11 +184,16 @@ static EventGroupHandle_t g_system_event_group;
 static SemaphoreHandle_t g_mode_mutex;
 #define EVT_GRP__BIT_CONTINUOUS_MODE_ACTIVE BIT0
 #define EVT_GRP__BIT_TRIGGER_SINGLE_SHOT BIT1
+#define EVT_GBP__BIT_OTA_IN_PROGRESS BIT2
+#define EVT_GBP__BIT_OTA_COMPLETED BIT3
 
 // Power saving
 esp_pm_config_t pm_config;
 esp_pm_lock_handle_t max_cpu_mz;
 esp_pm_lock_handle_t max_apb_mz;
+
+//OTA
+#define HASH_LEN 32
 
 
 static std::vector<std::vector<int>> model_inference_task(uint8_t* image, uint8_t width, uint8_t height, uint8_t channel){
@@ -235,6 +242,7 @@ static char* action_enum_to_string(ActionType action){
         case ACTION_STOP_INFERENCE: return"STOP_INFERENCE";
         case ACTION_RETURN_INFERENCE: return "INFERENCE_RESULT";
         case ACTION_MODE_SWITCH: return "MODE_SWITCH";
+        case ACTION_OTA: return "OTA";
         default: return "UNKNOWN_ACTION";   
     }
 }
@@ -354,6 +362,68 @@ static void websocket_sending_task(void* pvParameters){
 
 
 
+esp_err_t http_event_handler(esp_http_client_event_t* evt){
+    switch (evt->event_id){
+        case HTTP_EVENT_ERROR:
+            ESP_LOGD("OTA", "HTTP_EVENT_ERROR");
+            break;
+        case HTTP_EVENT_ON_CONNECTED:
+            ESP_LOGD("OTA", "HTTP_EVENT_ON_CONNECTED");
+            break;
+        case HTTP_EVENT_HEADER_SENT:
+            ESP_LOGD("OTA", "HTTP_EVENT_HEADER_SENT");
+            break;
+        case HTTP_EVENT_ON_HEADER:
+            ESP_LOGD("OTA", "HTTP_EVENT_ON_HEADER, key=%s, value=%s", evt->header_key, evt->header_value);
+            break;
+        case HTTP_EVENT_ON_DATA:
+            ESP_LOGD("OTA", "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
+            break;
+        case HTTP_EVENT_ON_FINISH:
+            ESP_LOGD("OTA", "HTTP_EVENT_ON_FINISH");
+            break;
+        case HTTP_EVENT_DISCONNECTED:
+            ESP_LOGD("OTA", "HTTP_EVENT_DISCONNECTED");
+            break;
+        case HTTP_EVENT_REDIRECT:
+            ESP_LOGD("OTA", "HTTP_EVENT_REDIRECT");
+            break;
+    }
+    return ESP_OK;
+}
+
+
+
+void ota_task(void *pvParameter){
+    ESP_LOGI("OTA", "Starting OTA example task");
+    ESP_LOGI("OTA", "Download path: %s", (char*)pvParameter);
+    esp_http_client_config_t config = {
+        .url = (char*)pvParameter,
+        .event_handler = http_event_handler,
+        .skip_cert_common_name_check = true,
+        .keep_alive_enable = true,
+    };
+
+    esp_https_ota_config_t ota_config = {
+        .http_config = &config
+    };
+
+    ESP_LOGI("OTA", "Attempting to download update from %s", config.url);
+    esp_err_t ret = esp_https_ota(&ota_config);
+    if(ret == ESP_OK){
+        ESP_LOGI("OTA", "OTA Succed, Rebooting");
+        xEventGroupClearBits(g_system_event_group, EVT_GBP__BIT_OTA_IN_PROGRESS);
+        xEventGroupSetBits(g_system_event_group, EVT_GBP__BIT_OTA_COMPLETED);
+    }else{
+        ESP_LOGI("OTA", "Firmware upgrade failed");
+        ESP_LOGW("OTA", "Failed reason: %s", esp_err_to_name(ret));
+    }
+    free(pvParameter);
+    vTaskDelete(NULL);
+}
+
+
+
 static void acquire_pm_lock(){
     esp_err_t res = esp_pm_lock_acquire(max_cpu_mz);
     if(res != ESP_OK){
@@ -382,16 +452,23 @@ static void release_pm_lock(){
 
 
 
+static void ota_update(char* uri){
+    xEventGroupSetBits(g_system_event_group, EVT_GBP__BIT_OTA_IN_PROGRESS);
+    xTaskCreate(&ota_task, "ota", 4096, uri, 5, NULL);
+}
+
+
+
 static void mode_switch(char* mode){
     if(xSemaphoreTake(g_mode_mutex, portMAX_DELAY) == pdTRUE ){   
         if(strcmp(mode, "CONTINUOUS_MODE") == 0){
             operation_mode = CONTINUOUS_MODE;
-            acquire_pm_lock();
+            // acquire_pm_lock();
             xEventGroupSetBits(g_system_event_group, EVT_GRP__BIT_CONTINUOUS_MODE_ACTIVE);
 
         }else if(strcmp(mode, "STAND_BY_MODE") == 0){
             operation_mode = STAND_BY_MODE;
-            release_pm_lock();
+            // release_pm_lock();
             xEventGroupClearBits(g_system_event_group, EVT_GRP__BIT_CONTINUOUS_MODE_ACTIVE);
             xEventGroupClearBits(g_system_event_group, EVT_GRP__BIT_TRIGGER_SINGLE_SHOT);
         }
@@ -441,6 +518,36 @@ static void websocket_process_task(void* pvParameters){
                         }else if(strcmp(action->valuestring, "INFERENCE") == 0){
                             xEventGroupSetBits(g_system_event_group, EVT_GRP__BIT_TRIGGER_SINGLE_SHOT);
 
+                        }else if(strcmp(action->valuestring, "OTA") == 0){
+                            sending_msg.action = ACTION_OTA;
+                            sending_msg.status = STATUS_RECEIVED;
+                            sending_msg.op_code = 0x01;
+                            
+                            cJSON* download_path = cJSON_GetObjectItem(msg_json, "download_path");
+                            // If message does not contain download path, return error
+                            if(download_path == NULL){
+                                ESP_LOGW("OTA","Download path does not exist.");
+                                sending_msg.status = STATUS_ERROR;
+                                xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
+                                continue;
+                            }
+
+                            char* ota_uri = (char*)malloc(strlen(download_path->valuestring)+1);
+                            // If heap does not availble, return error
+                            if(ota_uri == NULL){
+                                ESP_LOGW("OTA","Heap does not availble.");
+                                sending_msg.status = STATUS_ERROR;
+                                xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
+                                continue;
+                            }
+
+
+                            ota_uri[strlen(download_path->valuestring)] = 0;
+                            memcpy(ota_uri, download_path->valuestring, strlen(download_path->valuestring));
+                            ota_update(ota_uri);
+
+                        }else if(strcmp(action->valuestring, "RESET") == 0){
+                            esp_restart();
                         }else{
                             ESP_LOGW("Websocket", "Invalid task name");
                         }
@@ -546,6 +653,16 @@ static void camera_control_task(void* pvParameters){
     }
 
     while(1) {
+        if(xEventGroupGetBits(g_system_event_group) & EVT_GBP__BIT_OTA_IN_PROGRESS){
+            xEventGroupWaitBits(
+                g_system_event_group,
+                EVT_GBP__BIT_OTA_COMPLETED,
+                pdTRUE,
+                pdFALSE,
+                portMAX_DELAY
+            );
+        }
+
         OperationModeType local_mode = STAND_BY_MODE;
         if(xSemaphoreTake(g_mode_mutex, portMAX_DELAY) == pdTRUE){
             local_mode = operation_mode;
@@ -628,7 +745,6 @@ static void websocket_handler(void *handler_args, esp_event_base_t base, int32_t
                     free(msg.data);
                 }
 
-
             }else if(data->op_code == 0x09){
                 ESP_LOGW("Websocket","Received PING message");
             }else if(data->op_code == 0x08 && data->data_len == 2) {
@@ -654,7 +770,6 @@ static void websocket_handler(void *handler_args, esp_event_base_t base, int32_t
         case WEBSOCKET_EVENT_FINISH:
             ESP_LOGI("Websocket", "WEBSOCKET_EVENT_FINISHE");
             break;
-        
     }
 }
 
@@ -708,8 +823,8 @@ static void websocket_init_task(){
     }
 
     // Create websocket process task
-    xTaskCreatePinnedToCore(websocket_process_task,"Websocket process task", 2048, NULL, 6, NULL, tskNO_AFFINITY);
-    xTaskCreatePinnedToCore(websocket_sending_task, "Websocket sending task", 4096, NULL, 6, NULL, tskNO_AFFINITY);
+    xTaskCreatePinnedToCore(websocket_process_task,"Websocket process task", 2048, NULL, 4, NULL, tskNO_AFFINITY);
+    xTaskCreatePinnedToCore(websocket_sending_task, "Websocket sending task", 4096, NULL, 4, NULL, tskNO_AFFINITY);
     xTaskCreatePinnedToCore(camera_control_task, "Camera control task", 4096, NULL, 2, NULL, tskNO_AFFINITY);
 }
 
@@ -1162,16 +1277,40 @@ static void power_management_init(){
 
 
 
+static void print_sha256(const uint8_t* image_hash, const char* label){
+    char hash_print[32 * 2 + 1];
+    hash_print[HASH_LEN * 2] = 0;
+    for(int i = 0 ; i < HASH_LEN ; ++i) {
+        sprintf(&hash_print[i*2], "%02x", image_hash[i]);
+    }
+    ESP_LOGI("OTA", "%s %s", label, hash_print);
+}
+
+
+
+static void get_sha256_of_partitions(void){
+    uint8_t sha_256[HASH_LEN] = {0};
+    esp_partition_t partition;
+
+    // get sha256 digest for bootloader
+    partition.address = ESP_BOOTLOADER_OFFSET;
+    partition.size = ESP_PARTITION_TABLE_OFFSET;
+    partition.type = ESP_PARTITION_TYPE_APP;
+    esp_partition_get_sha256(&partition, sha_256);
+    print_sha256(sha_256, "SHA-256 for current firmware: ");
+}
+
+
+
 extern "C" void app_main(void){
     /**
      * 
-     * 1. 完成 OTA
-     * 2. 完成在 ESP32-S3 的 Model Deployment
-     * 3. Websocket reconnected
+     * 1. Model Deployment
+     * 2. Websocket reconnected
      * 
      */
     power_management_init();
     nvs_init();
+    get_sha256_of_partitions();
     wifi_init_task();
-    
 }
