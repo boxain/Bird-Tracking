@@ -34,13 +34,19 @@
 #include "esp_camera.h"
 #include "img_converters.h"
 #include "esp_http_client.h"
-#include "dl_tool.hpp"
-#include "human_face_detect_msr01.hpp"
-#include "human_face_detect_mnp01.hpp"
+// #include "dl_tool.hpp"
+// #include "human_face_detect_msr01.hpp"
+// #include "human_face_detect_mnp01.hpp"
 
 #include "esp_ota_ops.h"
 #include "esp_http_client.h"
 #include "esp_https_ota.h"
+
+
+// #include "human_face_detect.hpp"
+#include "cat_detect.hpp"
+#include "dl_model_base.hpp"
+
 
 
 // WIFI SETTING
@@ -51,7 +57,7 @@ static int s_retry_num = 0;
 static EventGroupHandle_t s_wifi_event_group;
 
 // WEBSOCKET SETTING
-#define WEBSOCKET_HOST "192.168.1.102"
+#define WEBSOCKET_HOST "192.168.1.103"
 #define WEBSOCKET_PORT 8000
 #define WEBSOCKET_PATH "/api/device/ws/6e837227-93b7-461b-bc73-caa9828b7f26"
 #define NO_DATA_TIMEOUT_SEC 43200 // 30 Days
@@ -72,6 +78,8 @@ enum ActionType {
     ACTION_RETURN_INFERENCE,
     ACTION_MODE_SWITCH,
     ACTION_OTA,
+    ACTION_MODEL_DOWNLOAD,
+    ACTION_MODEL_SWITCH,
     ACTION_LOG_INFO
 };
 
@@ -86,11 +94,11 @@ typedef struct {
 // WEBSOCKET SENDING MESSAGE QUEUE
 static QueueHandle_t  websocket_sending_message_queue;
 typedef struct {
-    uint8_t op_code;     // 換成 opcode       
+    uint8_t op_code;    
     ActionType action;
     uint8_t* image_data;
     size_t image_len;
-    std::vector<std::vector<int>> bounding_boxes;
+    std::list<dl::detect::result_t>* inference_result;
     StatusType status;
 } websocket_sending_message_t;
 
@@ -99,23 +107,40 @@ typedef struct {
 #define MAX_HTTP_OUTPUT_BUFFER 2048
 
 // Camera Setting
-#define CAM_PIN_PWDN 32
-#define CAM_PIN_RESET -1 //software reset will be performed
-#define CAM_PIN_XCLK 0
-#define CAM_PIN_SIOD 26
-#define CAM_PIN_SIOC 27
+// #define CAM_PIN_PWDN 32
+// #define CAM_PIN_RESET -1 //software reset will be performed
+// #define CAM_PIN_XCLK 0
+// #define CAM_PIN_SIOD 26
+// #define CAM_PIN_SIOC 27
 
-#define CAM_PIN_D7 35
-#define CAM_PIN_D6 34
-#define CAM_PIN_D5 39
-#define CAM_PIN_D4 36
-#define CAM_PIN_D3 21
-#define CAM_PIN_D2 19
-#define CAM_PIN_D1 18
-#define CAM_PIN_D0 5
-#define CAM_PIN_VSYNC 25
-#define CAM_PIN_HREF 23
-#define CAM_PIN_PCLK 22
+// #define CAM_PIN_D7 35
+// #define CAM_PIN_D6 34
+// #define CAM_PIN_D5 39
+// #define CAM_PIN_D4 36
+// #define CAM_PIN_D3 21
+// #define CAM_PIN_D2 19
+// #define CAM_PIN_D1 18
+// #define CAM_PIN_D0 5
+// #define CAM_PIN_VSYNC 25
+// #define CAM_PIN_HREF 23
+// #define CAM_PIN_PCLK 22
+
+#define CAM_PIN_PWDN -1
+#define CAM_PIN_RESET -1   //software reset will be performed
+#define CAM_PIN_VSYNC 6
+#define CAM_PIN_HREF 7
+#define CAM_PIN_PCLK 13
+#define CAM_PIN_XCLK 15
+#define CAM_PIN_SIOD 4
+#define CAM_PIN_SIOC 5
+#define CAM_PIN_D0 11
+#define CAM_PIN_D1 9
+#define CAM_PIN_D2 8
+#define CAM_PIN_D3 10
+#define CAM_PIN_D4 12
+#define CAM_PIN_D5 18
+#define CAM_PIN_D6 17
+#define CAM_PIN_D7 16
 
 #if ESP_CAMERA_SUPPORTED
 static camera_config_t camera_config = {
@@ -143,7 +168,7 @@ static camera_config_t camera_config = {
     .ledc_channel = LEDC_CHANNEL_0,
 
     .pixel_format = PIXFORMAT_JPEG, //YUV422,GRAYSCALE,RGB565,JPEG
-    .frame_size = FRAMESIZE_240X240,    //QQVGA-UXGA, For ESP32, do not use sizes above QVGA when not JPEG. The performance of the ESP32-S series has improved a lot, but JPEG mode always gives better frame rates.
+    .frame_size = FRAMESIZE_HVGA,    //QQVGA-UXGA, For ESP32, do not use sizes above QVGA when not JPEG. The performance of the ESP32-S series has improved a lot, but JPEG mode always gives better frame rates.
 
     .jpeg_quality = 25, //0-63, for OV series camera sensors, lower number means higher quality
     .fb_count = 1,       //When jpeg mode is used, if fb_count more than one, the driver will work in continuous mode.
@@ -168,10 +193,20 @@ static esp_err_t init_camera(void)
 // SD Card Setting
 #define MAX_READING_CHAR 64
 #define MOUNT_POINT "/sdcard"
+sdmmc_card_t* card;
 
-// Inference
-#define TWO_STAGE 0 /*<! 1: detect by two-stage which is more accurate but slower(with keypoints). */
-                    /*<! 0: detect by one-stage which is less accurate but faster(without keypoints). */
+// Model Setting
+CatDetect* model;
+static SemaphoreHandle_t g_model_mutex;
+typedef struct {
+    FILE* file;
+    int total_len;
+    int downloaded_len;
+    char* download_path;
+    char* model_id;
+} model_download_params_t ;
+
+
 
 // Mode switch
 enum OperationModeType {
@@ -186,6 +221,13 @@ static SemaphoreHandle_t g_mode_mutex;
 #define EVT_GRP__BIT_TRIGGER_SINGLE_SHOT BIT1
 #define EVT_GBP__BIT_OTA_IN_PROGRESS BIT2
 #define EVT_GBP__BIT_OTA_COMPLETED BIT3
+#define EVT_GBP__BIT_MODEL_DOWNLOAD_IN_PROGRESS BIT4
+#define EVT_GBP__BIT_MODEL_DOWNLOAD_IN_COMPLETED BIT5
+#define EVT_GBP__BIT_MODEL_SWITCH_IN_PROGRESS BIT6
+#define EVT_GBP__BIT_MODEL_SWITCH_COMPLETED BIT7
+#define ALL_IN_PROGRESS_BITS (EVT_GBP__BIT_OTA_IN_PROGRESS | EVT_GBP__BIT_MODEL_DOWNLOAD_IN_PROGRESS | EVT_GBP__BIT_MODEL_SWITCH_IN_PROGRESS)
+#define ALL_COMPLETED_BITS (EVT_GBP__BIT_OTA_COMPLETED | EVT_GBP__BIT_MODEL_DOWNLOAD_IN_COMPLETED | EVT_GBP__BIT_MODEL_SWITCH_COMPLETED)
+
 
 // Power saving
 esp_pm_config_t pm_config;
@@ -196,42 +238,125 @@ esp_pm_lock_handle_t max_apb_mz;
 #define HASH_LEN 32
 
 
-static std::vector<std::vector<int>> model_inference_task(uint8_t* image, uint8_t width, uint8_t height, uint8_t channel){
-    dl::tool::Latency latency;
-    // initialize
-#if TWO_STAGE
-    HumanFaceDetectMSR01 s1(0.01F, 0.1F, 10, 0.2F);
-    HumanFaceDetectMNP01 s2(0.01F, 0.1F, 5);
-#else // ONE_STAGE
-    HumanFaceDetectMSR01 s1(0.01F, 0.1F, 10, 0.2F);
-#endif
-
-    // inference
-    latency.start();
-#if TWO_STAGE
-    std::list<dl::detect::result_t> &candidates = s1.infer(image, {height, width, channel});
-    std::list<dl::detect::result_t> &results = s2.infer(image, {height, width, channel}, candidates);
-#else // ONE_STAGE
-    std::list<dl::detect::result_t> &results = s1.infer(image, {height, width, channel});
-#endif
-    latency.end();
-    latency.print("Inference latency");
-
-    // display
-    int i = 0;
-    std::vector<std::vector<int>> bounding_boxes;
-    for (std::list<dl::detect::result_t>::iterator prediction = results.begin() ; prediction != results.end(); prediction++, i++)
-    {
-        printf("[%d] score: %f, box: [%d, %d, %d, %d]\n", i, prediction->score, prediction->box[0], prediction->box[1], prediction->box[2], prediction->box[3]);
-        
-        std::vector<int> box_coords;
-        box_coords.push_back(prediction->box[0]);
-        box_coords.push_back(prediction->box[1]);
-        box_coords.push_back(prediction->box[2]);
-        box_coords.push_back(prediction->box[3]);
-        bounding_boxes.push_back(prediction->box);
+static std::list<dl::detect::result_t> model_inference(uint8_t* image, size_t len){
+    dl::image::jpeg_img_t jpeg_img = {.data = (void *)image, .data_len = len};
+    auto img = sw_decode_jpeg(jpeg_img, dl::image::DL_IMAGE_PIX_TYPE_RGB888);
+    
+    auto &detect_results = model->run(img);
+    for(const auto &res : detect_results){
+        ESP_LOGI("MODEL INFERENCE",
+                 "[category: %d, score: %f, x1: %d, y1: %d, x2: %d, y2: %d]",
+                 res.category,
+                 res.score,
+                 res.box[0],
+                 res.box[1],
+                 res.box[2],
+                 res.box[3]);
     }
-    return bounding_boxes;
+
+    std::list<dl::detect::result_t> results_copy = detect_results;
+
+    if(img.data != NULL){
+        free(img.data);
+        img.data = NULL;
+    }
+    
+    return results_copy;
+}
+
+
+
+static void model_init(char* model_id){
+    // Fetch semaphore first
+    if(xSemaphoreTake(g_model_mutex, portMAX_DELAY) == pdTRUE){
+        char path[128];
+        sprintf(path, "%s/%s/%s/%s.espdl", MOUNT_POINT, "models", model_id, model_id);
+
+        ESP_LOGI("MODEL SWITCH", "Starting model switch, path: %s", path);
+
+        // Release old model 
+        if(model){
+            delete model;
+            ESP_LOGI("MODEL SWITCH", "Release original model resources");
+        }
+
+        // Must setting FAT LFN ( Long File Name)
+        model = new CatDetect(path);
+        if(model){
+            ESP_LOGI("MODEL SWITCH", "Success");
+        }else{
+            ESP_LOGE("MODEL SWITCH", "Failed");
+            // unmount partition and disable SDMMC peripheral
+            esp_vfs_fat_sdcard_unmount(MOUNT_POINT, card);
+            ESP_LOGI("SD Card", "Card unmounted");
+        }
+
+        // Update event group to trigger other task
+        xEventGroupClearBits(g_system_event_group, EVT_GBP__BIT_MODEL_SWITCH_IN_PROGRESS);
+        xEventGroupSetBits(g_system_event_group, EVT_GBP__BIT_MODEL_SWITCH_COMPLETED);
+        xSemaphoreGive(g_mode_mutex);
+    }
+}
+
+
+
+static esp_err_t ensure_dir_exist(char* model_id){
+    
+    char model_root_path[128];
+    sprintf(model_root_path, "%s/%s", MOUNT_POINT, "models");
+    struct stat info;
+
+    if(stat(model_root_path, &info) == -1){
+        if(mkdir(model_root_path, 0755) != 0) {
+            ESP_LOGE("MKDIR", "Failed to create directory %s.", model_root_path);
+            return ESP_FAIL;
+        }
+        ESP_LOGI("MKDIR", "Success to create directory %s.", model_root_path);
+    }else{
+        if(!S_ISDIR(info.st_mode)){
+            ESP_LOGE("MKDIR", "Path %s exists but is not a directory.", model_root_path);
+            return ESP_FAIL;
+        }
+        ESP_LOGE("MKDIR", "Directory %s already exists.", model_root_path);
+    }
+
+    char model_sub_path[128];
+    sprintf(model_sub_path, "%s/%s/%s", MOUNT_POINT, "models", model_id);
+    if(stat(model_sub_path, &info) == -1){
+        if(mkdir(model_sub_path, 0755) != 0) {
+            ESP_LOGE("MKDIR", "Failed to create directory %s", model_sub_path);
+            return ESP_FAIL;
+        }
+        ESP_LOGI("MKDIR", "Success to create directory %s", model_sub_path);
+    }else{
+        if(!S_ISDIR(info.st_mode)){
+            ESP_LOGE("MKDIR", "Path %s exists but is not a directory.", model_sub_path);
+            return ESP_FAIL;
+        }
+        ESP_LOGE("MKDIR", "Directory %s already exists.", model_sub_path);
+    }
+
+    return ESP_OK;
+
+}
+
+
+
+static esp_err_t check_file_is_exist(char* model_id){
+    char model_full_path[128];
+    sprintf(model_full_path, "%s/%s/%s/%s.espdl", MOUNT_POINT, "models", model_id, model_id);
+    struct stat info;
+    if(stat(model_full_path, &info) == -1){
+        ESP_LOGE("FILE", "Model: %s does not exist.", model_full_path);
+        return ESP_FAIL;
+    }else{
+        if(!S_ISREG(info.st_mode)){
+            ESP_LOGE("FILE", "Path %s exists but is not a regular file.", model_full_path);
+            return ESP_FAIL;
+        }
+    }
+    ESP_LOGI("FILE", "Model file %s exists. Size: %ld bytes", model_full_path, info.st_size);
+    return ESP_OK;
 }
 
 
@@ -242,6 +367,8 @@ static char* action_enum_to_string(ActionType action){
         case ACTION_STOP_INFERENCE: return"STOP_INFERENCE";
         case ACTION_RETURN_INFERENCE: return "INFERENCE_RESULT";
         case ACTION_MODE_SWITCH: return "MODE_SWITCH";
+        case ACTION_MODEL_DOWNLOAD: return "MODEL_DOWNLOAD";
+        case ACTION_MODEL_SWITCH: return "MODEL_SWITCH";
         case ACTION_OTA: return "OTA";
         default: return "UNKNOWN_ACTION";   
     }
@@ -260,7 +387,7 @@ static char* status_enum_to_string(StatusType status){
 
 
 
-static char* inference_message2json(ActionType action, StatusType status, std::vector<std::vector<int>> bounding_boxes){
+static char* inference_message2json(ActionType action, StatusType status, std::list<dl::detect::result_t>* inference_results){
     // Root
     char* action_str = action_enum_to_string(action);
     char* status_str = status_enum_to_string(status);
@@ -271,17 +398,23 @@ static char* inference_message2json(ActionType action, StatusType status, std::v
 
     // Content
     cJSON* content = cJSON_CreateObject();
-    cJSON* bounding_boxes_array = cJSON_AddArrayToObject(content, "bounding_boxes");
+    cJSON* result_array = cJSON_AddArrayToObject(content, "inference_results");
 
-    for(const auto& box: bounding_boxes){
-        if (box.size() == 4){
-            cJSON* box_array = cJSON_CreateArray();
-            cJSON_AddItemToArray(box_array, cJSON_CreateNumber(box[0]));
-            cJSON_AddItemToArray(box_array, cJSON_CreateNumber(box[1]));
-            cJSON_AddItemToArray(box_array, cJSON_CreateNumber(box[2]));
-            cJSON_AddItemToArray(box_array, cJSON_CreateNumber(box[3]));
+    if(inference_results != NULL){
+        for(const auto& inference_result: *inference_results){
+
+            cJSON* result = cJSON_CreateObject();
+            cJSON_AddNumberToObject(result, "category", inference_result.category);
+            cJSON_AddNumberToObject(result, "score", inference_result.score);
+            cJSON* box = cJSON_AddArrayToObject(result, "box");
+
+            cJSON_AddItemToArray(box, cJSON_CreateNumber(inference_result.box[0]));
+            cJSON_AddItemToArray(box, cJSON_CreateNumber(inference_result.box[1]));
+            cJSON_AddItemToArray(box, cJSON_CreateNumber(inference_result.box[2]));
+            cJSON_AddItemToArray(box, cJSON_CreateNumber(inference_result.box[3]));
+                
+            cJSON_AddItemToArray(result_array, result);
             
-            cJSON_AddItemToArray(bounding_boxes_array, box_array);
         }
     }
 
@@ -328,12 +461,17 @@ static void websocket_sending_task(void* pvParameters){
             }else{
             // If is Inference Message
 
-                // --- Measure sending time
-                // int64_t send_start = esp_timer_get_time();
+                char* serialized_message = inference_message2json(msg.action, msg.status, msg.inference_result);
+                if (msg.inference_result != NULL) {
+                    delete msg.inference_result;
+                    msg.inference_result = NULL;
+                }
 
-                char* serialized_message = inference_message2json(msg.action, msg.status, msg.bounding_boxes);
                 if(serialized_message == NULL){
-                    free(msg.image_data);
+                    if (msg.image_data != NULL) {
+                        free(msg.image_data);
+                        msg.image_data = NULL;
+                    }
                 }else{
                     esp_websocket_client_send_bin(websocket_client,(char*)msg.image_data, msg.image_len, portMAX_DELAY);
                     free(msg.image_data);
@@ -341,20 +479,6 @@ static void websocket_sending_task(void* pvParameters){
                     esp_websocket_client_send_text(websocket_client, serialized_message, len, portMAX_DELAY);
                     free(serialized_message);
                 }
-                // int64_t send_end = esp_timer_get_time();
-                // int64_t sending_time = (send_end - send_start)/1000;
-
-                // if (result) {
-                //     if( sending_time >= 150 ) {
-                //         ESP_LOGW("Timing", "esp_websocket_client_send_bin took %lld ms for %d bytes", sending_time , msg.data_len);
-                //     }else{
-                //         ESP_LOGI("Timing", "esp_websocket_client_send_bin took %lld ms for %d bytes", sending_time , msg.data_len);
-                //     }
-                    
-                //     ESP_LOGI("Websocket Sending Task", "sending binary");
-                // }else {
-                //     ESP_LOGW("Websocket Sending Task", "sending binary failed");
-                // }
             }
         }            
     }
@@ -363,33 +487,106 @@ static void websocket_sending_task(void* pvParameters){
 
 
 esp_err_t http_event_handler(esp_http_client_event_t* evt){
+
+    model_download_params_t * params = (model_download_params_t *)evt->user_data;
+
     switch (evt->event_id){
-        case HTTP_EVENT_ERROR:
-            ESP_LOGD("OTA", "HTTP_EVENT_ERROR");
+        case HTTP_EVENT_ERROR:{
+            ESP_LOGI("OTA", "HTTP_EVENT_ERROR");
             break;
-        case HTTP_EVENT_ON_CONNECTED:
-            ESP_LOGD("OTA", "HTTP_EVENT_ON_CONNECTED");
+        }case HTTP_EVENT_ON_CONNECTED:{
+            ESP_LOGI("OTA", "HTTP_EVENT_ON_CONNECTED");
             break;
-        case HTTP_EVENT_HEADER_SENT:
-            ESP_LOGD("OTA", "HTTP_EVENT_HEADER_SENT");
+        }case HTTP_EVENT_HEADER_SENT:{
+            ESP_LOGI("OTA", "HTTP_EVENT_HEADER_SENT");
             break;
-        case HTTP_EVENT_ON_HEADER:
-            ESP_LOGD("OTA", "HTTP_EVENT_ON_HEADER, key=%s, value=%s", evt->header_key, evt->header_value);
+        }case HTTP_EVENT_ON_HEADER:{
+            ESP_LOGI("OTA", "HTTP_EVENT_ON_HEADER, key=%s, value=%s", evt->header_key, evt->header_value);
+            if(strcmp(evt->header_key, "content-length") == 0){
+                params->total_len = atoi(evt->header_value);
+                ESP_LOGI("HTTP_EVENT_ON_HEADER", "File size: %d bytes", params->total_len);
+            }
             break;
-        case HTTP_EVENT_ON_DATA:
-            ESP_LOGD("OTA", "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
+        }case HTTP_EVENT_ON_DATA:{
+            ESP_LOGI("OTA", "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
+            if(params->file==NULL){
+                esp_err_t is_dir_exist = ensure_dir_exist(params->model_id);
+                if(is_dir_exist == ESP_FAIL){
+                    return ESP_FAIL;
+                }                
+                char filepath[256];
+                snprintf(filepath, sizeof(filepath), "%s/models/%s/%s.espdl", MOUNT_POINT, params->model_id, params->model_id);
+                params->file = fopen(filepath, "wb");
+                if(!params->file){
+                    ESP_LOGE("HTTP_EVENT_ON_DATA", "Failed to open file %s for writing", filepath);
+                }
+                params->downloaded_len=0;
+            }
+            if(params->file){
+                int written = fwrite(evt->data, 1, evt->data_len, params->file);
+                if(written != evt->data_len){
+                    ESP_LOGE("HTTP_EVENT_ON_DATA", "File wrote wrror, written %d, expected %d", written, evt->data_len);
+                    return ESP_FAIL;
+                }
+                params->downloaded_len += written;
+                if(params->total_len == params->downloaded_len){
+                    fclose(params->file);
+                }else if(params->total_len > 0) {
+                    int progress = (params->downloaded_len * 100) / params->total_len;
+                    ESP_LOGI("HTTP_EVENT_ON_DATA", "Downloading: %d/%d bytes (%d%%)", params->downloaded_len, params->total_len, progress);
+                } else {
+                    ESP_LOGI("HTTP_EVENT_ON_DATA", "Downloading: %d bytes", params->downloaded_len);
+                }
+            }
             break;
-        case HTTP_EVENT_ON_FINISH:
+
+        }case HTTP_EVENT_ON_FINISH:{
             ESP_LOGD("OTA", "HTTP_EVENT_ON_FINISH");
             break;
-        case HTTP_EVENT_DISCONNECTED:
+        }case HTTP_EVENT_DISCONNECTED:{
             ESP_LOGD("OTA", "HTTP_EVENT_DISCONNECTED");
             break;
-        case HTTP_EVENT_REDIRECT:
+        }case HTTP_EVENT_REDIRECT:{
             ESP_LOGD("OTA", "HTTP_EVENT_REDIRECT");
             break;
+        }
     }
     return ESP_OK;
+}
+
+
+
+static void model_download_task(void *pvParameter){
+    model_download_params_t *params = (model_download_params_t *)pvParameter;
+    ESP_LOGI("MODEL_DOWNLOAD", "Starting model download task");
+    ESP_LOGI("MODEL_DOWNLOAD", "Download path: %s with model id:%s", params->download_path, params->model_id);
+
+    
+    esp_http_client_config_t config = {
+        .url = params->download_path,
+        .method = HTTP_METHOD_GET,
+        .timeout_ms = 10000,
+        .event_handler = http_event_handler,
+        .buffer_size = 4096,
+        .user_data = params,
+        .skip_cert_common_name_check = true  
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    
+    esp_err_t ret = esp_http_client_perform(client);
+    if(ret == ESP_OK){
+        ESP_LOGI("MODEL_DOWNLOAD", "Success");
+        xEventGroupClearBits(g_system_event_group, EVT_GBP__BIT_MODEL_DOWNLOAD_IN_PROGRESS);
+        xEventGroupSetBits(g_system_event_group, EVT_GBP__BIT_MODEL_DOWNLOAD_IN_COMPLETED);
+    }else{
+        ESP_LOGE("MODEL_DOWNLOAD", "Failed");
+        ESP_LOGE("MODEL_DOWNLOAD", "Failed reason: %s", esp_err_to_name(ret));
+    }
+
+    esp_http_client_cleanup(client);
+    free(params->model_id);
+    free(params->download_path);
+    vTaskDelete(NULL);
 }
 
 
@@ -452,6 +649,21 @@ static void release_pm_lock(){
 
 
 
+static void model_switch(char* model_id){
+    xEventGroupSetBits(g_system_event_group, EVT_GBP__BIT_MODEL_SWITCH_IN_PROGRESS);
+    model_init(model_id);
+    ESP_LOGI("MODEL SWITCH", "Switch complete");
+}
+
+
+
+static void model_download(model_download_params_t* params){
+    xEventGroupSetBits(g_system_event_group, EVT_GBP__BIT_MODEL_DOWNLOAD_IN_PROGRESS);
+    xTaskCreate(&model_download_task, "model_download_task", 4096, params, 5, NULL);
+}
+
+
+
 static void ota_update(char* uri){
     xEventGroupSetBits(g_system_event_group, EVT_GBP__BIT_OTA_IN_PROGRESS);
     xTaskCreate(&ota_task, "ota", 4096, uri, 5, NULL);
@@ -474,7 +686,7 @@ static void mode_switch(char* mode){
         }
 
         xSemaphoreGive(g_mode_mutex);
-        ESP_LOGI("MODEL SWITCH", "Switch complete");
+        ESP_LOGI("MODE SWITCH", "Switch complete");
     }
 }
 
@@ -518,6 +730,95 @@ static void websocket_process_task(void* pvParameters){
                         }else if(strcmp(action->valuestring, "INFERENCE") == 0){
                             xEventGroupSetBits(g_system_event_group, EVT_GRP__BIT_TRIGGER_SINGLE_SHOT);
 
+                        }else if(strcmp(action->valuestring, "MODEL_DOWNLOAD") == 0){
+                        
+                            sending_msg.action = ACTION_MODEL_DOWNLOAD;
+                            sending_msg.status = STATUS_RECEIVED;
+                            sending_msg.op_code = 0x01;
+                            model_download_params_t* params = (model_download_params_t*)malloc(sizeof(model_download_params_t));
+                            
+                            cJSON* parsed_download_path = cJSON_GetObjectItem(msg_json, "download_path");
+                            // If message does not contain download path, return error
+                            if(parsed_download_path == NULL){
+                                ESP_LOGW("MODEL_DEPLOYMENT","Download path does not exist.");
+                                sending_msg.status = STATUS_ERROR;
+                                xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
+                                free(params);
+                                continue;
+                            }
+
+                            char* download_path = (char*)malloc(strlen(parsed_download_path->valuestring)+1);
+                            // If heap does not availble, return error
+                            if(download_path == NULL){
+                                ESP_LOGW("MODEL_DEPLOYMENT","Heap does not availble.");
+                                sending_msg.status = STATUS_ERROR;
+                                xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
+                                free(params);
+                                continue;
+                            }
+
+                            // Copy string to pointer
+                            download_path[strlen(parsed_download_path->valuestring)] = 0;
+                            memcpy(download_path, parsed_download_path->valuestring, strlen(parsed_download_path->valuestring));
+
+
+                            cJSON* parsed_model_id = cJSON_GetObjectItem(msg_json, "model_id");
+                            // if message does not contain model id, return error
+                            if(parsed_model_id == NULL){
+                                ESP_LOGW("MODEL_DEPLOYMENT","model_id does not exist.");
+                                sending_msg.status = STATUS_ERROR;
+                                xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
+                                free(params);
+                                free(download_path);
+                                continue;
+                            }
+                            
+
+                            char* model_id = (char*)malloc(strlen(parsed_model_id->valuestring)+1);
+                            // If heap does not availble, return error
+                            if(model_id == NULL){
+                                ESP_LOGW("MODEL_DEPLOYMENT","Heap does not availble.");
+                                sending_msg.status = STATUS_ERROR;
+                                xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
+                                free(params);
+                                free(download_path);
+                                continue;
+                            }
+
+                            model_id[strlen(parsed_model_id->valuestring)] = 0;
+                            memcpy(model_id, parsed_model_id->valuestring, strlen(parsed_model_id->valuestring));
+                            
+                            params->download_path=download_path;
+                            params->model_id=model_id;
+                            params->file=NULL;
+                            params->total_len=0;
+                            params->downloaded_len=0;
+                            model_download(params);
+                        
+                        }else if(strcmp(action->valuestring, "MODEL_SWITCH") == 0){
+
+                            sending_msg.action = ACTION_MODEL_SWITCH;
+                            sending_msg.status = STATUS_RECEIVED;
+                            sending_msg.op_code = 0x01;
+                            
+                            cJSON* parsed_model_id = cJSON_GetObjectItem(msg_json, "model_id");
+                            if(parsed_model_id == NULL){
+                                ESP_LOGE("MODEL_SWITCH","model_id does not exist.");
+                                sending_msg.status = STATUS_ERROR;
+                                xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
+                                continue;
+                            }
+
+                            esp_err_t is_file_exist = check_file_is_exist(parsed_model_id->valuestring);
+                            if(is_file_exist == ESP_FAIL){
+                                ESP_LOGE("MODEL_SWITCH","file does not exist.");
+                                sending_msg.status = STATUS_ERROR;
+                                xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
+                                continue;
+                            }
+
+                            model_switch(parsed_model_id->valuestring);
+                        
                         }else if(strcmp(action->valuestring, "OTA") == 0){
                             sending_msg.action = ACTION_OTA;
                             sending_msg.status = STATUS_RECEIVED;
@@ -581,38 +882,13 @@ static void take_picture(){
     
     ESP_LOGI("Camera", "Picture taken! Its size was: %zu bytes, width: %zu, height: %zu.", pic->len, pic->width, pic->height);
 
-    // if websocket does't connected, and then release resouces and continues
+    //  if websocket does't connected, and then release resouces and continues
     bool websocket_connected = esp_websocket_client_is_connected(websocket_client);
     if(!websocket_connected){
         ESP_LOGE("Websocket", "Websocket doesn't connected.");
         esp_camera_fb_return(pic);
         return;
     }
-
-    // allocate heap for RGB565 format, if failed to allocate, released resources and continues
-    size_t rgb_len = pic->height*pic->width*2;
-    uint8_t* rgb_buffer = (uint8_t*)malloc(rgb_len);
-    if(rgb_buffer == NULL){
-        ESP_LOGE("Camera", "RGB Buffer allocate failed");
-        esp_camera_fb_return(pic);
-        return;
-    }
-
-    // convert image format from JPEG to RGB565, if failed convert, released resources and continues
-    bool conversion_success = jpg2rgb565(pic->buf, pic->len, rgb_buffer, JPG_SCALE_NONE);
-    if(!conversion_success){
-        ESP_LOGE("Camera", "Image converstion failed.");
-        free(rgb_buffer);
-        esp_camera_fb_return(pic);
-        rgb_buffer=NULL;
-        return;
-    }
-
-    // model inference, when inference completed, release memory about RGB565
-    std::vector<std::vector<int>> bounding_boxes = model_inference_task(rgb_buffer, pic->width, pic->height, 3);
-    free(rgb_buffer);
-    rgb_buffer=NULL;
-
 
     // allocate heap for JPEG buffer, in oder to avoid null pointer reference in websocket_sending_message_queue
     // if failed, released reousrces
@@ -623,24 +899,41 @@ static void take_picture(){
         return;
     }
 
-    // memory copy
-    memcpy(jpeg_buffer, pic->buf, pic->len);
-
     // prepare sending message struct
     websocket_sending_message_t msg = {0};
     msg.op_code = 0x02;
     msg.image_len = pic->len;
     msg.image_data = jpeg_buffer;
-    msg.bounding_boxes = std::move(bounding_boxes);
     msg.action = ACTION_RETURN_INFERENCE;
     msg.status = STATUS_COMPLETED;
-    BaseType_t send_result = xQueueSend(websocket_sending_message_queue, &msg, 0);
+    memcpy(jpeg_buffer, pic->buf, pic->len);
 
+
+    // model inference memory copy
+    if(model){
+        msg.inference_result = new std::list<dl::detect::result_t>();
+
+        if(msg.inference_result != NULL){
+            *msg.inference_result = model_inference(jpeg_buffer, pic->len);
+        }else{
+            ESP_LOGE("Camera", "Inference result buffer allocate failed");
+            free(jpeg_buffer);
+            jpeg_buffer=NULL;
+            return;
+        }
+    }else{
+        msg.inference_result = NULL;
+    }
+
+    BaseType_t send_result = xQueueSend(websocket_sending_message_queue, &msg, 0);
     if( send_result != pdPASS ){
         free(jpeg_buffer);
         jpeg_buffer = NULL;
+        if(msg.inference_result != NULL){
+            delete msg.inference_result;
+            msg.inference_result=NULL;
+        }
     }
-
     esp_camera_fb_return(pic);
 }
 
@@ -653,10 +946,10 @@ static void camera_control_task(void* pvParameters){
     }
 
     while(1) {
-        if(xEventGroupGetBits(g_system_event_group) & EVT_GBP__BIT_OTA_IN_PROGRESS){
+        if(xEventGroupGetBits(g_system_event_group) & ALL_IN_PROGRESS_BITS){
             xEventGroupWaitBits(
                 g_system_event_group,
-                EVT_GBP__BIT_OTA_COMPLETED,
+                ALL_COMPLETED_BITS,
                 pdTRUE,
                 pdFALSE,
                 portMAX_DELAY
@@ -811,11 +1104,18 @@ static void websocket_init_task(){
     // Create RTOS event group and semaphore
     g_system_event_group = xEventGroupCreate();
     g_mode_mutex = xSemaphoreCreateBinary();
+    g_model_mutex = xSemaphoreCreateBinary();
 
     if(g_mode_mutex == NULL){
-        ESP_LOGE("Semahore", "create failed...");
+        ESP_LOGE("Semaphore", "mode mutext create failed...");
     }else{
         xSemaphoreGive(g_mode_mutex);
+    }
+
+    if(g_model_mutex == NULL){
+        ESP_LOGE("Semaphore", "model mutext create failed...");
+    }else{
+        xSemaphoreGive(g_model_mutex);
     }
 
     if(g_system_event_group == NULL){
@@ -823,51 +1123,9 @@ static void websocket_init_task(){
     }
 
     // Create websocket process task
-    xTaskCreatePinnedToCore(websocket_process_task,"Websocket process task", 2048, NULL, 4, NULL, tskNO_AFFINITY);
+    xTaskCreatePinnedToCore(websocket_process_task,"Websocket process task", 4096, NULL, 4, NULL, tskNO_AFFINITY);
     xTaskCreatePinnedToCore(websocket_sending_task, "Websocket sending task", 4096, NULL, 4, NULL, tskNO_AFFINITY);
     xTaskCreatePinnedToCore(camera_control_task, "Camera control task", 4096, NULL, 2, NULL, tskNO_AFFINITY);
-}
-
-
-
-static esp_err_t sdmmc_card_write_file(const char* path, char* data){
-    ESP_LOGI("SD Card", "Opening file %s", path);
-
-    FILE* f = fopen(path, "w");
-    if( f == NULL ){
-        ESP_LOGE("SD Card", "Failed to open file for writing");
-        return ESP_FAIL;
-    }
-
-    fprintf(f, data);
-    fclose(f);
-    ESP_LOGI("SD Card", "File written");
-
-    return ESP_OK;
-}
-
-
-
-static esp_err_t sdmmc_card_read_file(const char* path){
-    ESP_LOGI("SD Card", "Reading file %s", path);
-
-    FILE* f = fopen(path, "r");
-    if( f == NULL ){
-        ESP_LOGE("SD Card", "Failed to open file for reading");
-        return ESP_FAIL;
-    }
-    
-    char line[MAX_READING_CHAR];
-    fgets(line, sizeof(line), f);
-    fclose(f);
-
-    char* pos = strchr(line, '\n');
-    if(pos){
-        *pos = '\0'; // ?
-    }
-    ESP_LOGI("SD Card", "Read from file: '%s'", line);
-    
-    return ESP_OK;
 }
 
 
@@ -877,16 +1135,11 @@ static void sdmmc_card_init_task(){
 
     // Options for mounting the filesystem.
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
-#ifdef CONFIG_EXAMPLE_FORMAT_IF_MOUNT_FAILED
         .format_if_mount_failed = true,
-#else
-        .format_if_mount_failed = false,
-#endif
-        .max_files = 3,
+        .max_files = 5,
         .allocation_unit_size = 16 * 1024
     };
 
-    sdmmc_card_t* card;
     const char mount_point[] = MOUNT_POINT;
     ESP_LOGI("SD Card", "Initializing SD card");
     ESP_LOGI("SD Card", "Using SDMMC peripheral");
@@ -896,7 +1149,7 @@ static void sdmmc_card_init_task(){
     // For setting a specific frequency, use host.max_freq_khz (range 400kHz - 40MHz for SDMMC)
     // Example: for fixed frequency of 10MHz, use host.max_freq_khz = 10000
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-#if CONFIG_EXAMPLE_SDMMC_SPEED_HS
+#if CONFIG_SDMMC_SPEED_HS
     host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
 #elif CONFIG_EXAMPLE_SDMMC_SPEED_UHS_I_SDR50
     host.slot = SDMMC_HOST_SLOT_0;
@@ -944,14 +1197,12 @@ static void sdmmc_card_init_task(){
     // On chips where the GPIOs used for SD card can be configured, set them in
     // the slot_config structure:
 #ifdef CONFIG_SOC_SDMMC_USE_GPIO_MATRIX
-    slot_config.clk = CONFIG_EXAMPLE_PIN_CLK;
-    slot_config.cmd = CONFIG_EXAMPLE_PIN_CMD;
-    slot_config.d0 = CONFIG_EXAMPLE_PIN_D0;
-#ifdef CONFIG_EXAMPLE_SDMMC_BUS_WIDTH_4
-    slot_config.d1 = CONFIG_EXAMPLE_PIN_D1;
-    slot_config.d2 = CONFIG_EXAMPLE_PIN_D2;
-    slot_config.d3 = CONFIG_EXAMPLE_PIN_D3;
-#endif
+    slot_config.clk = GPIO_NUM_39;
+    slot_config.cmd = GPIO_NUM_38;
+    slot_config.d0 = GPIO_NUM_40;
+    // slot_config.d1 = GPIO_NUM_38;
+    // slot_config.d2 = GPIO_NUM_33;
+    // slot_config.d3 = GPIO_NUM_34;
 #endif
     slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
 
@@ -975,80 +1226,6 @@ static void sdmmc_card_init_task(){
     // Card has been initialized, print its properties
     ESP_LOGI("SD Card", "Filesystem mounted");
     sdmmc_card_print_info(stdout, card);
-
-    // Use POSIX and C standard library functions to work with files
-    // Create a file.
-    const char* file_hello = MOUNT_POINT"/hello.txt";
-    char data[MAX_READING_CHAR];
-    snprintf(data, MAX_READING_CHAR, "%s %s!\n", "Hello", card->cid.name);
-    ret = sdmmc_card_write_file(file_hello, data);
-    if(ret != ESP_OK){
-        return;
-    }
-
-
-    const char* file_foo = MOUNT_POINT"/foo.txt";
-    // Check if destination file exist before renaming
-    struct stat st;
-    if(stat(file_foo, &st) == 0){
-        // Delete it if it exists
-        unlink(file_foo);
-    }
-
-    // Rename original file
-    ESP_LOGI("SD Card", "Renaming file %s to %s", file_hello, file_foo);
-    if(rename(file_hello, file_foo) != 0){
-        ESP_LOGE("SD Card", "Rename failed");
-        return;
-    }
-
-    ret = sdmmc_card_read_file(file_foo);
-    if(ret != ESP_OK){
-        return;
-    }
-
-
-    // Format FATFS
-#ifdef CONFIG_EXAMPLE_FORMAT_SD_CARD
-    ret = esp_vfs_fat_sdcard_format(mount_point, card);
-    if(ret != ESP_OK){
-        ESP_LOGE(TAG, "Failed to format FATFS (%s)", esp_err_to_name(ret));
-        return;
-    }
-
-    if(stat(file_foo, &st) == 0){
-        ESP_LOGI("SD Card", "file still exists");
-        return;
-    }else{
-        ESP_LOGI("SD Card", "file doesn't exist, formatting done");
-    }
-#endif
-
-    const char* file_nihao = MOUNT_POINT"/nihao.txt";
-    memset(data, 0, MAX_READING_CHAR);
-    snprintf(data, MAX_READING_CHAR, "%s %s!\n", "Nihao", card->cid.name);
-    ret = sdmmc_card_write_file(file_nihao, data);
-    if(ret != ESP_OK){
-        return;
-    }
-
-    ret = sdmmc_card_read_file(file_nihao);
-    if(ret != ESP_OK){
-        return;
-    }
-
-    // All done, unmount partition and disable SDMMC peripheral
-    esp_vfs_fat_sdcard_unmount(mount_point, card);
-    ESP_LOGI("SD Card", "Card unmounted");
-
-    // Deinitialize the power control driver if it was used
-#if CONFIG_EXAMPLE_SD_PWR_CTRL_LDO_INTERNAL_IO
-    ret = sd_pwr_ctrl_del_on_chip_ldo(pwr_ctrl_handle);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to delete the on-chip LDO power control driver");
-        return;
-    }
-#endif
 }
 
 
@@ -1304,13 +1481,19 @@ static void get_sha256_of_partitions(void){
 
 extern "C" void app_main(void){
     /**
-     * 
-     * 1. Model Deployment
-     * 2. Websocket reconnected
-     * 
+     * 1. customize model init class
      */
-    power_management_init();
+    // power_management_init();
     nvs_init();
+    sdmmc_card_init_task();
     get_sha256_of_partitions();
     wifi_init_task();
 }
+
+/**
+ * CONFIG_COMPILER_OPTIMIZATION_PERF --- y
+ * CONFIG_SPIRAM_SPEED_80M           --- y
+ * CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240 --- y
+ * CONFIG_FATFS_LFN_STACK --- y
+ * CONFIG_SOC_XTAL_SUPPORT_40M(SD card) --- y
+ */

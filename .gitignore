@@ -4,6 +4,7 @@ sdkconfig
 sdkconfig.old
 dependencies.lock
 main/Kconfig.projbuild
+managed_components/
 
 # about IDE
 .vscode/
@@ -11,3 +12,4 @@ project_tree.txt
 
 # about model
 model/
+componentss/
