@@ -34,18 +34,12 @@
 #include "esp_camera.h"
 #include "img_converters.h"
 #include "esp_http_client.h"
-// #include "dl_tool.hpp"
-// #include "human_face_detect_msr01.hpp"
-// #include "human_face_detect_mnp01.hpp"
-
-#include "esp_ota_ops.h"
-#include "esp_http_client.h"
 #include "esp_https_ota.h"
+#include "esp_ota_ops.h"
 
-
-// #include "human_face_detect.hpp"
-#include "cat_detect.hpp"
 #include "dl_model_base.hpp"
+#include "cat_detect.hpp"
+
 
 
 
@@ -57,9 +51,9 @@ static int s_retry_num = 0;
 static EventGroupHandle_t s_wifi_event_group;
 
 // WEBSOCKET SETTING
-#define WEBSOCKET_HOST "192.168.1.103"
+#define WEBSOCKET_HOST "192.168.1.102"
 #define WEBSOCKET_PORT 8000
-#define WEBSOCKET_PATH "/api/device/ws/6e837227-93b7-461b-bc73-caa9828b7f26"
+#define WEBSOCKET_PATH "/api/device/ws/b70e1454-75d8-4ff0-bc2f-3f6b055a6e92"
 #define NO_DATA_TIMEOUT_SEC 43200 // 30 Days
 static char MAC[18];
 static esp_websocket_client_handle_t websocket_client;
@@ -92,10 +86,12 @@ typedef struct {
 } websocket_received_message_t;
 
 // WEBSOCKET SENDING MESSAGE QUEUE
+#define TASK_ID_MAX_LEN 37
 static QueueHandle_t  websocket_sending_message_queue;
 typedef struct {
     uint8_t op_code;    
     ActionType action;
+    char task_id[TASK_ID_MAX_LEN];
     uint8_t* image_data;
     size_t image_len;
     std::list<dl::detect::result_t>* inference_result;
@@ -204,8 +200,8 @@ typedef struct {
     int downloaded_len;
     char* download_path;
     char* model_id;
+    char task_id[TASK_ID_MAX_LEN];
 } model_download_params_t ;
-
 
 
 // Mode switch
@@ -236,7 +232,10 @@ esp_pm_lock_handle_t max_apb_mz;
 
 //OTA
 #define HASH_LEN 32
-
+typedef struct {
+    char* download_path;
+    char task_id[TASK_ID_MAX_LEN];
+} ota_params_t ;
 
 static std::list<dl::detect::result_t> model_inference(uint8_t* image, size_t len){
     dl::image::jpeg_img_t jpeg_img = {.data = (void *)image, .data_len = len};
@@ -266,7 +265,7 @@ static std::list<dl::detect::result_t> model_inference(uint8_t* image, size_t le
 
 
 
-static void model_init(char* model_id){
+static void model_init(char* model_id, char* task_id){
     // Fetch semaphore first
     if(xSemaphoreTake(g_model_mutex, portMAX_DELAY) == pdTRUE){
         char path[128];
@@ -282,13 +281,30 @@ static void model_init(char* model_id){
 
         // Must setting FAT LFN ( Long File Name)
         model = new CatDetect(path);
+        websocket_sending_message_t sending_msg = {0};
         if(model){
             ESP_LOGI("MODEL SWITCH", "Success");
+
+            // Sending completed message
+            sending_msg.op_code = 0x01;
+            sending_msg.action = ACTION_MODEL_SWITCH;
+            sending_msg.status = STATUS_COMPLETED;
+            strncpy(sending_msg.task_id, task_id, TASK_ID_MAX_LEN-1);
+            sending_msg.task_id[TASK_ID_MAX_LEN-1] = '\0';
+            xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
+
         }else{
             ESP_LOGE("MODEL SWITCH", "Failed");
+            // Sending error message
+            sending_msg.op_code = 0x01;
+            sending_msg.action = ACTION_MODEL_SWITCH;
+            sending_msg.status = STATUS_ERROR;
+            strncpy(sending_msg.task_id, task_id, TASK_ID_MAX_LEN-1);
+            sending_msg.task_id[TASK_ID_MAX_LEN-1] = '\0';
+            xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
             // unmount partition and disable SDMMC peripheral
-            esp_vfs_fat_sdcard_unmount(MOUNT_POINT, card);
-            ESP_LOGI("SD Card", "Card unmounted");
+            // esp_vfs_fat_sdcard_unmount(MOUNT_POINT, card);
+            // ESP_LOGI("SD Card", "Card unmounted");
         }
 
         // Update event group to trigger other task
@@ -427,13 +443,14 @@ static char* inference_message2json(ActionType action, StatusType status, std::l
 
 
 
-static char* control_message2json(ActionType action, StatusType status){
+static char* control_message2json(ActionType action, StatusType status, char* task_id){
     char* action_str = action_enum_to_string(action);
     char* status_str = status_enum_to_string(status);
 
     cJSON* root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "action", action_str);
     cJSON_AddStringToObject(root, "status", status_str);
+    cJSON_AddStringToObject(root, "task_id", task_id);
 
     char* result = cJSON_Print(root);
     cJSON_Delete(root);
@@ -452,7 +469,7 @@ static void websocket_sending_task(void* pvParameters){
             // If is Control Message
             if(msg.op_code == 0x01){
 
-                char* serialized_message = control_message2json(msg.action, msg.status);
+                char* serialized_message = control_message2json(msg.action, msg.status, msg.task_id);
                 if(serialized_message != NULL){
                     int len = strlen(serialized_message);
                     esp_websocket_client_send_text(websocket_client, serialized_message, len, portMAX_DELAY);
@@ -488,7 +505,7 @@ static void websocket_sending_task(void* pvParameters){
 
 esp_err_t http_event_handler(esp_http_client_event_t* evt){
 
-    model_download_params_t * params = (model_download_params_t *)evt->user_data;
+    // model_download_params_t * params = (model_download_params_t *)evt->user_data;
 
     switch (evt->event_id){
         case HTTP_EVENT_ERROR:{
@@ -502,43 +519,43 @@ esp_err_t http_event_handler(esp_http_client_event_t* evt){
             break;
         }case HTTP_EVENT_ON_HEADER:{
             ESP_LOGI("OTA", "HTTP_EVENT_ON_HEADER, key=%s, value=%s", evt->header_key, evt->header_value);
-            if(strcmp(evt->header_key, "content-length") == 0){
-                params->total_len = atoi(evt->header_value);
-                ESP_LOGI("HTTP_EVENT_ON_HEADER", "File size: %d bytes", params->total_len);
-            }
+            // if(strcmp(evt->header_key, "content-length") == 0){
+            //     params->total_len = atoi(evt->header_value);
+            //     ESP_LOGI("HTTP_EVENT_ON_HEADER", "File size: %d bytes", params->total_len);
+            // }
             break;
         }case HTTP_EVENT_ON_DATA:{
             ESP_LOGI("OTA", "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
-            if(params->file==NULL){
-                esp_err_t is_dir_exist = ensure_dir_exist(params->model_id);
-                if(is_dir_exist == ESP_FAIL){
-                    return ESP_FAIL;
-                }                
-                char filepath[256];
-                snprintf(filepath, sizeof(filepath), "%s/models/%s/%s.espdl", MOUNT_POINT, params->model_id, params->model_id);
-                params->file = fopen(filepath, "wb");
-                if(!params->file){
-                    ESP_LOGE("HTTP_EVENT_ON_DATA", "Failed to open file %s for writing", filepath);
-                }
-                params->downloaded_len=0;
-            }
-            if(params->file){
-                int written = fwrite(evt->data, 1, evt->data_len, params->file);
-                if(written != evt->data_len){
-                    ESP_LOGE("HTTP_EVENT_ON_DATA", "File wrote wrror, written %d, expected %d", written, evt->data_len);
-                    return ESP_FAIL;
-                }
-                params->downloaded_len += written;
-                if(params->total_len == params->downloaded_len){
-                    fclose(params->file);
-                }else if(params->total_len > 0) {
-                    int progress = (params->downloaded_len * 100) / params->total_len;
-                    ESP_LOGI("HTTP_EVENT_ON_DATA", "Downloading: %d/%d bytes (%d%%)", params->downloaded_len, params->total_len, progress);
-                } else {
-                    ESP_LOGI("HTTP_EVENT_ON_DATA", "Downloading: %d bytes", params->downloaded_len);
-                }
-            }
             break;
+            // if(params->file==NULL){
+            //     esp_err_t is_dir_exist = ensure_dir_exist(params->model_id);
+            //     if(is_dir_exist == ESP_FAIL){
+            //         return ESP_FAIL;
+            //     }                
+            //     char filepath[256];
+            //     snprintf(filepath, sizeof(filepath), "%s/models/%s/%s.espdl", MOUNT_POINT, params->model_id, params->model_id);
+            //     params->file = fopen(filepath, "wb");
+            //     if(!params->file){
+            //         ESP_LOGE("HTTP_EVENT_ON_DATA", "Failed to open file %s for writing", filepath);
+            //     }
+            //     params->downloaded_len=0;
+            // }
+            // if(params->file){
+            //     int written = fwrite(evt->data, 1, evt->data_len, params->file);
+            //     if(written != evt->data_len){
+            //         ESP_LOGE("HTTP_EVENT_ON_DATA", "File wrote wrror, written %d, expected %d", written, evt->data_len);
+            //         return ESP_FAIL;
+            //     }
+            //     params->downloaded_len += written;
+            //     if(params->total_len == params->downloaded_len){
+            //         fclose(params->file);
+            //     }else if(params->total_len > 0) {
+            //         int progress = (params->downloaded_len * 100) / params->total_len;
+            //         ESP_LOGI("HTTP_EVENT_ON_DATA", "Downloading: %d/%d bytes (%d%%)", params->downloaded_len, params->total_len, progress);
+            //     } else {
+            //         ESP_LOGI("HTTP_EVENT_ON_DATA", "Downloading: %d bytes", params->downloaded_len);
+            //     }
+            // }
 
         }case HTTP_EVENT_ON_FINISH:{
             ESP_LOGD("OTA", "HTTP_EVENT_ON_FINISH");
@@ -565,7 +582,7 @@ static void model_download_task(void *pvParameter){
     esp_http_client_config_t config = {
         .url = params->download_path,
         .method = HTTP_METHOD_GET,
-        .timeout_ms = 10000,
+        .timeout_ms = 60000,
         .event_handler = http_event_handler,
         .buffer_size = 4096,
         .user_data = params,
@@ -574,28 +591,49 @@ static void model_download_task(void *pvParameter){
     esp_http_client_handle_t client = esp_http_client_init(&config);
     
     esp_err_t ret = esp_http_client_perform(client);
+    websocket_sending_message_t sending_msg = {0};
     if(ret == ESP_OK){
         ESP_LOGI("MODEL_DOWNLOAD", "Success");
+        // Sending completed message
+        sending_msg.op_code = 0x01;
+        sending_msg.action = ACTION_MODEL_DOWNLOAD;
+        sending_msg.status = STATUS_COMPLETED;
+        strncpy(sending_msg.task_id, params->task_id, TASK_ID_MAX_LEN-1);
+        sending_msg.task_id[TASK_ID_MAX_LEN-1] = '\0';
+        xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
+
+        // Trigger other task
         xEventGroupClearBits(g_system_event_group, EVT_GBP__BIT_MODEL_DOWNLOAD_IN_PROGRESS);
         xEventGroupSetBits(g_system_event_group, EVT_GBP__BIT_MODEL_DOWNLOAD_IN_COMPLETED);
     }else{
         ESP_LOGE("MODEL_DOWNLOAD", "Failed");
         ESP_LOGE("MODEL_DOWNLOAD", "Failed reason: %s", esp_err_to_name(ret));
+
+        // Sending error message
+        sending_msg.op_code = 0x01;
+        sending_msg.action = ACTION_MODEL_DOWNLOAD;
+        sending_msg.status = STATUS_ERROR;
+        strncpy(sending_msg.task_id, params->task_id, TASK_ID_MAX_LEN-1);
+        sending_msg.task_id[TASK_ID_MAX_LEN-1] = '\0';
+        xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
     }
 
     esp_http_client_cleanup(client);
     free(params->model_id);
     free(params->download_path);
+
+
     vTaskDelete(NULL);
 }
 
 
 
 void ota_task(void *pvParameter){
+    ota_params_t* params = (ota_params_t*) pvParameter;
     ESP_LOGI("OTA", "Starting OTA example task");
-    ESP_LOGI("OTA", "Download path: %s", (char*)pvParameter);
+    ESP_LOGI("OTA", "Download path: %s", params->download_path);
     esp_http_client_config_t config = {
-        .url = (char*)pvParameter,
+        .url = params->download_path,
         .event_handler = http_event_handler,
         .skip_cert_common_name_check = true,
         .keep_alive_enable = true,
@@ -607,13 +645,31 @@ void ota_task(void *pvParameter){
 
     ESP_LOGI("OTA", "Attempting to download update from %s", config.url);
     esp_err_t ret = esp_https_ota(&ota_config);
+    websocket_sending_message_t sending_msg = {0};
     if(ret == ESP_OK){
         ESP_LOGI("OTA", "OTA Succed, Rebooting");
+
+        // Sending completed message
+        sending_msg.op_code = 0x01;
+        sending_msg.action = ACTION_OTA;
+        sending_msg.status = STATUS_COMPLETED;
+        strncpy(sending_msg.task_id, params->task_id, TASK_ID_MAX_LEN-1);
+        sending_msg.task_id[TASK_ID_MAX_LEN-1] = '\0';
+        xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
+
         xEventGroupClearBits(g_system_event_group, EVT_GBP__BIT_OTA_IN_PROGRESS);
         xEventGroupSetBits(g_system_event_group, EVT_GBP__BIT_OTA_COMPLETED);
     }else{
         ESP_LOGI("OTA", "Firmware upgrade failed");
         ESP_LOGW("OTA", "Failed reason: %s", esp_err_to_name(ret));
+
+        // Sending error message
+        sending_msg.op_code = 0x01;
+        sending_msg.action = ACTION_OTA;
+        sending_msg.status = STATUS_ERROR;
+        strncpy(sending_msg.task_id, params->task_id, TASK_ID_MAX_LEN-1);
+        sending_msg.task_id[TASK_ID_MAX_LEN-1] = '\0';
+        xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
     }
     free(pvParameter);
     vTaskDelete(NULL);
@@ -649,9 +705,9 @@ static void release_pm_lock(){
 
 
 
-static void model_switch(char* model_id){
+static void model_switch(char* model_id, char* task_id){
     xEventGroupSetBits(g_system_event_group, EVT_GBP__BIT_MODEL_SWITCH_IN_PROGRESS);
-    model_init(model_id);
+    model_init(model_id, task_id);
     ESP_LOGI("MODEL SWITCH", "Switch complete");
 }
 
@@ -664,14 +720,14 @@ static void model_download(model_download_params_t* params){
 
 
 
-static void ota_update(char* uri){
+static void ota_update(ota_params_t* params){
     xEventGroupSetBits(g_system_event_group, EVT_GBP__BIT_OTA_IN_PROGRESS);
-    xTaskCreate(&ota_task, "ota", 4096, uri, 5, NULL);
+    xTaskCreate(&ota_task, "ota", 4096, params, 5, NULL);
 }
 
 
 
-static void mode_switch(char* mode){
+static void mode_switch(char* mode, char* task_id){
     if(xSemaphoreTake(g_mode_mutex, portMAX_DELAY) == pdTRUE ){   
         if(strcmp(mode, "CONTINUOUS_MODE") == 0){
             operation_mode = CONTINUOUS_MODE;
@@ -687,6 +743,13 @@ static void mode_switch(char* mode){
 
         xSemaphoreGive(g_mode_mutex);
         ESP_LOGI("MODE SWITCH", "Switch complete");
+        websocket_sending_message_t sending_msg = {0};
+        sending_msg.op_code = 0x01;
+        sending_msg.action = ACTION_MODE_SWITCH;
+        sending_msg.status = STATUS_COMPLETED;
+        strncpy(sending_msg.task_id, task_id, TASK_ID_MAX_LEN-1);
+        sending_msg.task_id[TASK_ID_MAX_LEN-1] = '\0';
+        xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
     }
 }
 
@@ -715,17 +778,37 @@ static void websocket_process_task(void* pvParameters){
                         websocket_sending_message_t sending_msg = {0};
                         
                         if(strcmp(action->valuestring, "MODE_SWITCH") == 0){
-                            cJSON* mode = cJSON_GetObjectItem(msg_json, "mode");
-                            if(mode == NULL){
-                                ESP_LOGW("Websocket", "Invalid task name");
-                            }else{
-                                // Send received notification, if using MQTT protocal does not do it.
-                                sending_msg.action = ACTION_MODE_SWITCH;
-                                sending_msg.status = STATUS_RECEIVED;
-                                sending_msg.op_code = 0x01;
+                            
+                            sending_msg.action = ACTION_MODE_SWITCH;
+                            sending_msg.status = STATUS_RECEIVED;
+                            sending_msg.op_code = 0x01;
+                            cJSON* parsed_mode = cJSON_GetObjectItem(msg_json, "mode");
+                            cJSON* parsed_task_id = cJSON_GetObjectItem(msg_json, "task_id");
+                            
+                            if(parsed_mode == NULL){
+                                ESP_LOGW("MODE_SWITCH", "Mode does not exist.");                       
+                                sending_msg.status = STATUS_ERROR;
                                 xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
-                                mode_switch(mode->valuestring);
+                                continue;
                             }
+
+                            if(parsed_task_id == NULL){
+                                ESP_LOGW("MODE_SWITCH", "task_id does not exist.");                       
+                                sending_msg.status = STATUS_ERROR;
+                                xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
+                                continue;
+                            }
+
+                            // Send received notification, if using MQTT protocal does not do it.
+                            sending_msg.action = ACTION_MODE_SWITCH;
+                            sending_msg.status = STATUS_RECEIVED;
+                            sending_msg.op_code = 0x01;
+                            strncpy(sending_msg.task_id, parsed_task_id->valuestring, TASK_ID_MAX_LEN-1);
+                            sending_msg.task_id[TASK_ID_MAX_LEN-1]='\0';
+
+                            xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
+                            mode_switch(parsed_mode->valuestring, parsed_task_id->valuestring);
+                            
 
                         }else if(strcmp(action->valuestring, "INFERENCE") == 0){
                             xEventGroupSetBits(g_system_event_group, EVT_GRP__BIT_TRIGGER_SINGLE_SHOT);
@@ -736,6 +819,14 @@ static void websocket_process_task(void* pvParameters){
                             sending_msg.status = STATUS_RECEIVED;
                             sending_msg.op_code = 0x01;
                             model_download_params_t* params = (model_download_params_t*)malloc(sizeof(model_download_params_t));
+
+                            cJSON* parsed_task_id = cJSON_GetObjectItem(msg_json, "task_id");
+                            if(parsed_task_id == NULL){
+                                ESP_LOGW("MODE_SWITCH", "task_id does not exist.");                       
+                                sending_msg.status = STATUS_ERROR;
+                                xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
+                                continue;
+                            }
                             
                             cJSON* parsed_download_path = cJSON_GetObjectItem(msg_json, "download_path");
                             // If message does not contain download path, return error
@@ -793,6 +884,14 @@ static void websocket_process_task(void* pvParameters){
                             params->file=NULL;
                             params->total_len=0;
                             params->downloaded_len=0;
+                            strncpy(params->task_id, parsed_task_id->valuestring, TASK_ID_MAX_LEN-1);
+                            params->task_id[TASK_ID_MAX_LEN-1]='\0';
+
+                            // Send received notification, if using MQTT protocal does not do it.
+                            strncpy(sending_msg.task_id, parsed_task_id->valuestring, TASK_ID_MAX_LEN-1);
+                            sending_msg.task_id[TASK_ID_MAX_LEN-1]='\0';
+                            xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
+
                             model_download(params);
                         
                         }else if(strcmp(action->valuestring, "MODEL_SWITCH") == 0){
@@ -809,6 +908,14 @@ static void websocket_process_task(void* pvParameters){
                                 continue;
                             }
 
+                            cJSON* parsed_task_id = cJSON_GetObjectItem(msg_json, "task_id");
+                            if(parsed_task_id == NULL){
+                                ESP_LOGW("MODE_SWITCH", "task_id does not exist.");                       
+                                sending_msg.status = STATUS_ERROR;
+                                xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
+                                continue;
+                            }
+
                             esp_err_t is_file_exist = check_file_is_exist(parsed_model_id->valuestring);
                             if(is_file_exist == ESP_FAIL){
                                 ESP_LOGE("MODEL_SWITCH","file does not exist.");
@@ -817,35 +924,66 @@ static void websocket_process_task(void* pvParameters){
                                 continue;
                             }
 
-                            model_switch(parsed_model_id->valuestring);
+                            
+                            // Send received notification, if using MQTT protocal does not do it.
+                            strncpy(sending_msg.task_id, parsed_task_id->valuestring, TASK_ID_MAX_LEN-1);
+                            sending_msg.task_id[TASK_ID_MAX_LEN-1]='\0';
+                            xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
+
+                            model_switch(parsed_model_id->valuestring, parsed_task_id->valuestring);
                         
                         }else if(strcmp(action->valuestring, "OTA") == 0){
                             sending_msg.action = ACTION_OTA;
                             sending_msg.status = STATUS_RECEIVED;
                             sending_msg.op_code = 0x01;
                             
-                            cJSON* download_path = cJSON_GetObjectItem(msg_json, "download_path");
+                            cJSON* parsed_download_path = cJSON_GetObjectItem(msg_json, "download_path");
                             // If message does not contain download path, return error
-                            if(download_path == NULL){
+                            if(parsed_download_path == NULL){
                                 ESP_LOGW("OTA","Download path does not exist.");
                                 sending_msg.status = STATUS_ERROR;
                                 xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
                                 continue;
                             }
 
-                            char* ota_uri = (char*)malloc(strlen(download_path->valuestring)+1);
+                            cJSON* parsed_task_id = cJSON_GetObjectItem(msg_json, "task_id");
+                            if(parsed_task_id == NULL){
+                                ESP_LOGW("MODE_SWITCH", "task_id does not exist.");                       
+                                sending_msg.status = STATUS_ERROR;
+                                xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
+                                continue;
+                            }
+
                             // If heap does not availble, return error
-                            if(ota_uri == NULL){
+                            ota_params_t* params = (ota_params_t*)malloc(sizeof(ota_params_t));
+                            if(params == NULL){
                                 ESP_LOGW("OTA","Heap does not availble.");
                                 sending_msg.status = STATUS_ERROR;
                                 xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
                                 continue;
                             }
 
+                            char* download_path = (char*)malloc(strlen(parsed_download_path->valuestring)+1);
+                            // If heap does not availble, return error
+                            if(download_path == NULL){
+                                ESP_LOGW("OTA","Heap does not availble.");
+                                sending_msg.status = STATUS_ERROR;
+                                xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
+                                continue;
+                            }
 
-                            ota_uri[strlen(download_path->valuestring)] = 0;
-                            memcpy(ota_uri, download_path->valuestring, strlen(download_path->valuestring));
-                            ota_update(ota_uri);
+                            // Send received notification, if using MQTT protocal does not do it.
+                            strncpy(sending_msg.task_id, parsed_task_id->valuestring, TASK_ID_MAX_LEN-1);
+                            sending_msg.task_id[TASK_ID_MAX_LEN-1]='\0';
+                            xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
+                            
+                            // Prepare ota params
+                            memcpy(download_path, parsed_download_path->valuestring, strlen(parsed_download_path->valuestring));
+                            download_path[strlen(parsed_download_path->valuestring)] = 0;
+                            params->download_path = download_path;
+                            strncpy(params->task_id, parsed_task_id->valuestring, TASK_ID_MAX_LEN-1);
+                            params->task_id[TASK_ID_MAX_LEN-1]='\0';
+                            ota_update(params);
 
                         }else if(strcmp(action->valuestring, "RESET") == 0){
                             esp_restart();
@@ -969,7 +1107,7 @@ static void camera_control_task(void* pvParameters){
                 take_picture();
                 vTaskDelay(10000 / portTICK_PERIOD_MS);
             }else{
-                vTaskDelay(50);
+                vTaskDelay(10000);
             }
             
         }else if (local_mode == STAND_BY_MODE){
@@ -1482,6 +1620,10 @@ static void get_sha256_of_partitions(void){
 extern "C" void app_main(void){
     /**
      * 1. customize model init class
+     * 2. nvs
+     * 3. log
+     * 4. device authentication 
+     * 5. split code
      */
     // power_management_init();
     nvs_init();
@@ -1496,4 +1638,5 @@ extern "C" void app_main(void){
  * CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240 --- y
  * CONFIG_FATFS_LFN_STACK --- y
  * CONFIG_SOC_XTAL_SUPPORT_40M(SD card) --- y
+ * CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP      --- y
  */
