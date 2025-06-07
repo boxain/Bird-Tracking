@@ -41,8 +41,6 @@
 #include "cat_detect.hpp"
 
 
-
-
 // WIFI SETTING
 #define EXAMPLE_ESP_WIFI_MAXIMUM_RETRY 5
 #define WIFI_CONNECTED_BIT BIT0
@@ -50,10 +48,20 @@
 static int s_retry_num = 0;
 static EventGroupHandle_t s_wifi_event_group;
 
+// SERVER SETTING
+#define SERVER_HOST "http://192.168.1.101:8000"
+
+// HTTP SETTING
+#define AUTH_HTTP_PATH "api/device"
+typedef struct {
+    char* data_buffer;
+    int total_len;
+    int downloaded_len;
+} http_response_t;
+
 // WEBSOCKET SETTING
-#define WEBSOCKET_HOST "192.168.1.101"
-#define WEBSOCKET_PORT 8000
-#define WEBSOCKET_PATH "/api/device/ws/b70e1454-75d8-4ff0-bc2f-3f6b055a6e92"
+#define WEBSOCKET_HOST "ws://192.168.1.101:8000"
+#define WEBSOCKET_PATH "api/device/ws"
 #define NO_DATA_TIMEOUT_SEC 43200 // 30 Days
 static char MAC[18];
 static esp_websocket_client_handle_t websocket_client;
@@ -1242,17 +1250,16 @@ static void websocket_handler(void *handler_args, esp_event_base_t base, int32_t
 
 
 static void websocket_init_task(){
-
     // Setting Websockt config
-    char websocket_path[70];
-    snprintf(websocket_path, size_t(websocket_path), "%s/%s", WEBSOCKET_PATH, MAC);
+    char websocket_path[50];
+    snprintf(websocket_path, size_t(websocket_path), "%s/%s", WEBSOCKET_HOST, WEBSOCKET_PATH);
     ESP_LOGI("Websocket", "Path: %s", websocket_path);
 
     esp_websocket_client_config_t websocket_cfg = {};
-    websocket_cfg.host = WEBSOCKET_HOST;
-    websocket_cfg.port = WEBSOCKET_PORT;
-    websocket_cfg.path = websocket_path;
+    websocket_cfg.uri = websocket_path;
     websocket_cfg.disable_auto_reconnect = false;
+    char* auth_header = "Authorization: bearer token\r\n";
+    websocket_cfg.headers = auth_header;
 
     // Init Websocket client
     websocket_client = esp_websocket_client_init(&websocket_cfg);
@@ -1521,6 +1528,138 @@ esp_err_t custom_prov_data_handler(uint32_t session_id, const uint8_t* inbuf, ss
 
 
 
+esp_err_t auth_http_event_handler(esp_http_client_event_t* evt){
+
+    http_response_t* params = (http_response_t*)evt->user_data;
+
+    const char* tag = "Authorization HTTP EVENT";
+    switch (evt->event_id){
+        case HTTP_EVENT_ERROR:{
+            ESP_LOGI(tag, "HTTP_EVENT_ERROR");
+            break;
+        }case HTTP_EVENT_ON_CONNECTED:{
+            ESP_LOGI(tag, "HTTP_EVENT_ON_CONNECTED");
+            break;
+        }case HTTP_EVENT_HEADER_SENT:{
+            ESP_LOGI(tag, "HTTP_EVENT_HEADER_SENT");
+            break;
+        }case HTTP_EVENT_ON_HEADER:{
+            ESP_LOGI(tag, "HTTP_EVENT_ON_HEADER, key=%s, value=%s", evt->header_key, evt->header_value);
+            if(strcmp(evt->header_key, "content-length") == 0){
+                params->total_len = atoi(evt->header_value);
+                ESP_LOGI("HTTP_EVENT_ON_HEADER", "Response size: %d bytes", params->total_len);
+            }
+            break;
+        }case HTTP_EVENT_ON_DATA:{
+            ESP_LOGI(tag, "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
+            if(params->data_buffer == NULL){
+                char* data_buffer_pointer = (char*)malloc(params->total_len+1);
+                if(data_buffer_pointer == NULL){
+                    ESP_LOGE("tag", "Failed to allocate heap memory for data_buffer_pointer.");
+                    return ESP_FAIL;
+                }else{
+                    data_buffer_pointer[params->total_len] = '\0';
+                    params->data_buffer = data_buffer_pointer;
+                }
+            }
+
+            memcpy(params->data_buffer + params->downloaded_len, evt->data, evt->data_len);
+            params->downloaded_len += evt->data_len;
+            break;
+        }case HTTP_EVENT_ON_FINISH:{
+            ESP_LOGD(tag, "HTTP_EVENT_ON_FINISH");
+            break;
+        }case HTTP_EVENT_DISCONNECTED:{
+            ESP_LOGD(tag, "HTTP_EVENT_DISCONNECTED");
+            break;
+        }case HTTP_EVENT_REDIRECT:{
+            ESP_LOGD(tag, "HTTP_EVENT_REDIRECT");
+            break;
+        }
+    }
+    return ESP_OK;
+}
+
+
+
+static char* http_message2json(){
+
+    // Get MAC
+    uint8_t mac[6];
+    esp_err_t err = esp_efuse_mac_get_default(mac);
+    if(err != ESP_OK){
+        ESP_LOGE("MAC", "Get Mac address failed\n");
+        return NULL;
+    }
+
+    snprintf(MAC, sizeof(MAC), "%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    ESP_LOGI("MAC", "MAC Address is: %s", MAC);
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "name", "esp32s3");
+    cJSON_AddStringToObject(root, "processor", "esp32s3");
+    cJSON_AddStringToObject(root, "mac", MAC);
+
+    char* result = cJSON_Print(root);
+    cJSON_Delete(root);
+    return result;
+    
+}
+
+
+
+static http_response_t* auth_http_request(){
+    ESP_LOGI("AUTH HTTP REQUEST", "Starting");
+    char http_path[50];
+    snprintf(http_path, size_t(http_path), "%s/%s", SERVER_HOST, AUTH_HTTP_PATH);
+    ESP_LOGI("AUTH HTTP_REQUEST", "Path: %s", http_path);
+
+    http_response_t* params = (http_response_t*)malloc(sizeof(http_response_t));
+    if(params == NULL){
+        ESP_LOGI("AUTH HTTP_REQUEST", "Failed to allocate heap memory.");
+        return NULL;
+    }
+    params->data_buffer = NULL;
+    params->total_len = 0;
+    params->downloaded_len = 0;
+
+    esp_http_client_config_t config = {
+        .url = http_path,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 5000,
+        .event_handler = auth_http_event_handler,
+        .buffer_size = 4096,
+        .user_data = params,
+        .skip_cert_common_name_check = true  
+    };
+
+    char* post_data = http_message2json();
+    if(post_data == NULL){
+        ESP_LOGI("AUTH HTTP_REQUEST", "Failed to generate post data.");
+        return NULL;
+    }
+    ESP_LOGI("AUTH HTTP_REQUEST", "post data: %s", post_data);
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(client, post_data, strlen(post_data));
+    esp_err_t ret = esp_http_client_perform(client);
+    if(ret == ESP_OK){
+        ESP_LOGI("AUTH HTTP_REQUEST", "Success");
+        ESP_LOGI("AUTH HTTP_REQUEST", "response: %s", params->data_buffer);
+        return params;
+    }else{
+        ESP_LOGE("AUTH HTTP_REQUEST", "Failed");
+        ESP_LOGE("AUTH HTTP_REQUEST", "Failed reason: %s", esp_err_to_name(ret));
+        if(params->data_buffer != NULL){
+            free(params->data_buffer);
+        }
+        free(params);
+        return NULL;
+    }
+    free(post_data);
+}
+
+
+
 void wifi_init_task(){
     s_wifi_event_group = xEventGroupCreate();
     ESP_ERROR_CHECK(esp_netif_init());                     // create netif to init TCP/IP stack
@@ -1578,16 +1717,22 @@ void wifi_init_task(){
     );
 
     if (bits & WIFI_CONNECTED_BIT) {
-        uint8_t mac[6];
-        esp_err_t err = esp_efuse_mac_get_default(mac);
-        if(err != ESP_OK){
-            ESP_LOGE("MAC", "Get Mac address failed\n");
-        }else{
-            snprintf(MAC, sizeof(MAC), "%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-            ESP_LOGI("MAC", "MAC Address is: %s", MAC);
+        // uint8_t mac[6];
+        // esp_err_t err = esp_efuse_mac_get_default(mac);
+        // if(err != ESP_OK){
+        //     ESP_LOGE("MAC", "Get Mac address failed\n");
+        // }else{
+        //     snprintf(MAC, sizeof(MAC), "%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        //     ESP_LOGI("MAC", "MAC Address is: %s", MAC);
+        //     websocket_init_task();
+        // }
+        http_response_t* response = auth_http_request();
+        if(response){
+            free(response->data_buffer);
+            free(response);
             websocket_init_task();
         }
-        
+
     }
 }
 
