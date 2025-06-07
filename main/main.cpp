@@ -51,7 +51,7 @@ static int s_retry_num = 0;
 static EventGroupHandle_t s_wifi_event_group;
 
 // WEBSOCKET SETTING
-#define WEBSOCKET_HOST "192.168.1.102"
+#define WEBSOCKET_HOST "192.168.1.101"
 #define WEBSOCKET_PORT 8000
 #define WEBSOCKET_PATH "/api/device/ws/b70e1454-75d8-4ff0-bc2f-3f6b055a6e92"
 #define NO_DATA_TIMEOUT_SEC 43200 // 30 Days
@@ -503,68 +503,68 @@ static void websocket_sending_task(void* pvParameters){
 
 
 
-esp_err_t http_event_handler(esp_http_client_event_t* evt){
+esp_err_t model_download_http_event_handler(esp_http_client_event_t* evt){
 
-    // model_download_params_t * params = (model_download_params_t *)evt->user_data;
+    model_download_params_t * params = (model_download_params_t *)evt->user_data;
+    const char* tag = "MODEL DOWNLOAD HTTP EVENT";
 
     switch (evt->event_id){
         case HTTP_EVENT_ERROR:{
-            ESP_LOGI("OTA", "HTTP_EVENT_ERROR");
+            ESP_LOGI(tag, "HTTP_EVENT_ERROR");
             break;
         }case HTTP_EVENT_ON_CONNECTED:{
-            ESP_LOGI("OTA", "HTTP_EVENT_ON_CONNECTED");
+            ESP_LOGI(tag, "HTTP_EVENT_ON_CONNECTED");
             break;
         }case HTTP_EVENT_HEADER_SENT:{
-            ESP_LOGI("OTA", "HTTP_EVENT_HEADER_SENT");
+            ESP_LOGI(tag, "HTTP_EVENT_HEADER_SENT");
             break;
         }case HTTP_EVENT_ON_HEADER:{
-            ESP_LOGI("OTA", "HTTP_EVENT_ON_HEADER, key=%s, value=%s", evt->header_key, evt->header_value);
-            // if(strcmp(evt->header_key, "content-length") == 0){
-            //     params->total_len = atoi(evt->header_value);
-            //     ESP_LOGI("HTTP_EVENT_ON_HEADER", "File size: %d bytes", params->total_len);
-            // }
+            ESP_LOGI(tag, "HTTP_EVENT_ON_HEADER, key=%s, value=%s", evt->header_key, evt->header_value);
+            if(strcmp(evt->header_key, "content-length") == 0){
+                params->total_len = atoi(evt->header_value);
+                ESP_LOGI("HTTP_EVENT_ON_HEADER", "File size: %d bytes", params->total_len);
+            }
             break;
         }case HTTP_EVENT_ON_DATA:{
-            ESP_LOGI("OTA", "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
+            ESP_LOGI(tag, "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
+            if(params->file==NULL){
+                esp_err_t is_dir_exist = ensure_dir_exist(params->model_id);
+                if(is_dir_exist == ESP_FAIL){
+                    return ESP_FAIL;
+                }                
+                char filepath[256];
+                snprintf(filepath, sizeof(filepath), "%s/models/%s/%s.espdl", MOUNT_POINT, params->model_id, params->model_id);
+                params->file = fopen(filepath, "wb");
+                if(!params->file){
+                    ESP_LOGE(tag, "Failed to open file %s for writing", filepath);
+                }
+                params->downloaded_len=0;
+            }
+            if(params->file){
+                int written = fwrite(evt->data, 1, evt->data_len, params->file);
+                if(written != evt->data_len){
+                    ESP_LOGE(tag, "File wrote wrror, written %d, expected %d", written, evt->data_len);
+                    return ESP_FAIL;
+                }
+                params->downloaded_len += written;
+                if(params->total_len == params->downloaded_len){
+                    fclose(params->file);
+                }else if(params->total_len > 0) {
+                    int progress = (params->downloaded_len * 100) / params->total_len;
+                    ESP_LOGI(tag, "Downloading: %d/%d bytes (%d%%)", params->downloaded_len, params->total_len, progress);
+                } else {
+                    ESP_LOGI(tag, "Downloading: %d bytes", params->downloaded_len);
+                }
+            }
             break;
-            // if(params->file==NULL){
-            //     esp_err_t is_dir_exist = ensure_dir_exist(params->model_id);
-            //     if(is_dir_exist == ESP_FAIL){
-            //         return ESP_FAIL;
-            //     }                
-            //     char filepath[256];
-            //     snprintf(filepath, sizeof(filepath), "%s/models/%s/%s.espdl", MOUNT_POINT, params->model_id, params->model_id);
-            //     params->file = fopen(filepath, "wb");
-            //     if(!params->file){
-            //         ESP_LOGE("HTTP_EVENT_ON_DATA", "Failed to open file %s for writing", filepath);
-            //     }
-            //     params->downloaded_len=0;
-            // }
-            // if(params->file){
-            //     int written = fwrite(evt->data, 1, evt->data_len, params->file);
-            //     if(written != evt->data_len){
-            //         ESP_LOGE("HTTP_EVENT_ON_DATA", "File wrote wrror, written %d, expected %d", written, evt->data_len);
-            //         return ESP_FAIL;
-            //     }
-            //     params->downloaded_len += written;
-            //     if(params->total_len == params->downloaded_len){
-            //         fclose(params->file);
-            //     }else if(params->total_len > 0) {
-            //         int progress = (params->downloaded_len * 100) / params->total_len;
-            //         ESP_LOGI("HTTP_EVENT_ON_DATA", "Downloading: %d/%d bytes (%d%%)", params->downloaded_len, params->total_len, progress);
-            //     } else {
-            //         ESP_LOGI("HTTP_EVENT_ON_DATA", "Downloading: %d bytes", params->downloaded_len);
-            //     }
-            // }
-
         }case HTTP_EVENT_ON_FINISH:{
-            ESP_LOGD("OTA", "HTTP_EVENT_ON_FINISH");
+            ESP_LOGD(tag, "HTTP_EVENT_ON_FINISH");
             break;
         }case HTTP_EVENT_DISCONNECTED:{
-            ESP_LOGD("OTA", "HTTP_EVENT_DISCONNECTED");
+            ESP_LOGD(tag, "HTTP_EVENT_DISCONNECTED");
             break;
         }case HTTP_EVENT_REDIRECT:{
-            ESP_LOGD("OTA", "HTTP_EVENT_REDIRECT");
+            ESP_LOGD(tag, "HTTP_EVENT_REDIRECT");
             break;
         }
     }
@@ -583,7 +583,7 @@ static void model_download_task(void *pvParameter){
         .url = params->download_path,
         .method = HTTP_METHOD_GET,
         .timeout_ms = 60000,
-        .event_handler = http_event_handler,
+        .event_handler = model_download_http_event_handler,
         .buffer_size = 4096,
         .user_data = params,
         .skip_cert_common_name_check = true  
@@ -628,13 +628,48 @@ static void model_download_task(void *pvParameter){
 
 
 
+esp_err_t ota_http_event_handler(esp_http_client_event_t* evt){
+
+    const char* tag = "OTA HTTP EVENT";
+    switch (evt->event_id){
+        case HTTP_EVENT_ERROR:{
+            ESP_LOGI(tag, "HTTP_EVENT_ERROR");
+            break;
+        }case HTTP_EVENT_ON_CONNECTED:{
+            ESP_LOGI(tag, "HTTP_EVENT_ON_CONNECTED");
+            break;
+        }case HTTP_EVENT_HEADER_SENT:{
+            ESP_LOGI(tag, "HTTP_EVENT_HEADER_SENT");
+            break;
+        }case HTTP_EVENT_ON_HEADER:{
+            ESP_LOGI(tag, "HTTP_EVENT_ON_HEADER, key=%s, value=%s", evt->header_key, evt->header_value);
+            break;
+        }case HTTP_EVENT_ON_DATA:{
+            ESP_LOGI(tag, "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
+            break;
+        }case HTTP_EVENT_ON_FINISH:{
+            ESP_LOGD(tag, "HTTP_EVENT_ON_FINISH");
+            break;
+        }case HTTP_EVENT_DISCONNECTED:{
+            ESP_LOGD(tag, "HTTP_EVENT_DISCONNECTED");
+            break;
+        }case HTTP_EVENT_REDIRECT:{
+            ESP_LOGD(tag, "HTTP_EVENT_REDIRECT");
+            break;
+        }
+    }
+    return ESP_OK;
+}
+
+
+
 void ota_task(void *pvParameter){
     ota_params_t* params = (ota_params_t*) pvParameter;
     ESP_LOGI("OTA", "Starting OTA example task");
     ESP_LOGI("OTA", "Download path: %s", params->download_path);
     esp_http_client_config_t config = {
         .url = params->download_path,
-        .event_handler = http_event_handler,
+        .event_handler = ota_http_event_handler,
         .skip_cert_common_name_check = true,
         .keep_alive_enable = true,
     };
