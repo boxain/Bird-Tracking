@@ -1602,7 +1602,8 @@ static char* http_message2json(){
     cJSON_AddStringToObject(root, "name", "esp32s3");
     cJSON_AddStringToObject(root, "processor", "esp32s3");
     cJSON_AddStringToObject(root, "mac", MAC);
-
+    cJSON_AddStringToObject(root, "user_name", CONFIG_ESP_SERVER_USERNAME);
+    cJSON_AddStringToObject(root, "password", CONFIG_ESP_SERVER_PASSWORD);
     char* result = cJSON_Print(root);
     cJSON_Delete(root);
     return result;
