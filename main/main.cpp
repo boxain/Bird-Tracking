@@ -49,7 +49,7 @@ static int s_retry_num = 0;
 static EventGroupHandle_t s_wifi_event_group;
 
 // SERVER SETTING
-#define SERVER_HOST "http://192.168.1.101:8000"
+#define SERVER_HOST "http://192.168.1.103:8000"
 
 // HTTP SETTING
 #define AUTH_HTTP_PATH "api/device"
@@ -60,7 +60,7 @@ typedef struct {
 } http_response_t;
 
 // WEBSOCKET SETTING
-#define WEBSOCKET_HOST "ws://192.168.1.101:8000"
+#define WEBSOCKET_HOST "ws://192.168.1.103:8000"
 #define WEBSOCKET_PATH "api/device/ws"
 #define NO_DATA_TIMEOUT_SEC 43200 // 30 Days
 static char MAC[18];
@@ -1249,7 +1249,7 @@ static void websocket_handler(void *handler_args, esp_event_base_t base, int32_t
 
 
 
-static void websocket_init_task(){
+static void websocket_init_task(char* access_token){
     // Setting Websockt config
     char websocket_path[50];
     snprintf(websocket_path, size_t(websocket_path), "%s/%s", WEBSOCKET_HOST, WEBSOCKET_PATH);
@@ -1258,7 +1258,11 @@ static void websocket_init_task(){
     esp_websocket_client_config_t websocket_cfg = {};
     websocket_cfg.uri = websocket_path;
     websocket_cfg.disable_auto_reconnect = false;
-    char* auth_header = "Authorization: bearer token\r\n";
+    // Cause HTTP define each header need to add "\r\n" to represent next line.
+    char auth_header[350];
+    snprintf(auth_header, sizeof(auth_header), "Authorization: %s\r\n", access_token);
+    free(access_token);
+    ESP_LOGI("Websocket", "auth header: %s", auth_header);
     websocket_cfg.headers = auth_header;
 
     // Init Websocket client
@@ -1607,15 +1611,15 @@ static char* http_message2json(){
 
 
 
-static http_response_t* auth_http_request(){
-    ESP_LOGI("AUTH HTTP REQUEST", "Starting");
+static char* auth_http_request(){
+    ESP_LOGI("AUTH_HTTP_REQUEST", "Starting");
     char http_path[50];
     snprintf(http_path, size_t(http_path), "%s/%s", SERVER_HOST, AUTH_HTTP_PATH);
-    ESP_LOGI("AUTH HTTP_REQUEST", "Path: %s", http_path);
+    ESP_LOGI("AUTH_HTTP_REQUEST", "Path: %s", http_path);
 
     http_response_t* params = (http_response_t*)malloc(sizeof(http_response_t));
     if(params == NULL){
-        ESP_LOGI("AUTH HTTP_REQUEST", "Failed to allocate heap memory.");
+        ESP_LOGI("AUTH_HTTP_REQUEST", "Failed to allocate heap memory.");
         return NULL;
     }
     params->data_buffer = NULL;
@@ -1634,28 +1638,65 @@ static http_response_t* auth_http_request(){
 
     char* post_data = http_message2json();
     if(post_data == NULL){
-        ESP_LOGI("AUTH HTTP_REQUEST", "Failed to generate post data.");
+        ESP_LOGI("AUTH_HTTP_REQUEST", "Failed to generate post data.");
         return NULL;
     }
-    ESP_LOGI("AUTH HTTP_REQUEST", "post data: %s", post_data);
+
+    ESP_LOGI("AUTH_HTTP_REQUEST", "post data: %s", post_data);
     esp_http_client_handle_t client = esp_http_client_init(&config);
     esp_http_client_set_header(client, "Content-Type", "application/json");
     esp_http_client_set_post_field(client, post_data, strlen(post_data));
     esp_err_t ret = esp_http_client_perform(client);
+    free(post_data);
+    
     if(ret == ESP_OK){
-        ESP_LOGI("AUTH HTTP_REQUEST", "Success");
-        ESP_LOGI("AUTH HTTP_REQUEST", "response: %s", params->data_buffer);
-        return params;
+        ESP_LOGI("AUTH_HTTP_REQUEST", "Success");
+        ESP_LOGI("AUTH_HTTP_REQUEST", "response: %s", params->data_buffer);
+        if(params->data_buffer == NULL){
+            ESP_LOGI("AUTH_HTTP_REQUEST", "The data buffer pointer is null.");
+            free(params);
+            return NULL;
+        }
+
+        cJSON* parsed_response = cJSON_Parse(params->data_buffer);
+        if(parsed_response == NULL){
+            ESP_LOGI("AUTH_HTTP_REQUEST", "Failed to parsed post data into JSON format.");
+            free(params->data_buffer);
+            free(params);
+            return NULL;
+        }
+
+        cJSON* parsed_access_token = cJSON_GetObjectItem(parsed_response, "access_token");
+        if(parsed_access_token == NULL){
+            ESP_LOGI("AUTH_HTTP_REQUEST", "The response data does not have access token.");
+            free(params->data_buffer);
+            free(params);
+            return NULL;
+        }
+
+
+        char* token_value_ptr = parsed_access_token->valuestring;
+        char* access_token = strdup(token_value_ptr);
+        if(access_token == NULL){
+            ESP_LOGE("AUTH_HTTP_REQUEST", "Failed to allocate memory for access token copy.");
+        }else{
+            ESP_LOGI("AUTH_HTTP_REQUEST", "access token: %s\n", access_token);
+        }
+
+        free(params->data_buffer);
+        free(params);
+        cJSON_Delete(parsed_response);
+        return access_token;
+
     }else{
-        ESP_LOGE("AUTH HTTP_REQUEST", "Failed");
-        ESP_LOGE("AUTH HTTP_REQUEST", "Failed reason: %s", esp_err_to_name(ret));
+        ESP_LOGE("AUTH_HTTP_REQUEST", "Failed");
+        ESP_LOGE("AUTH_HTTP_REQUEST", "Failed reason: %s", esp_err_to_name(ret));
         if(params->data_buffer != NULL){
             free(params->data_buffer);
         }
         free(params);
         return NULL;
     }
-    free(post_data);
 }
 
 
@@ -1717,20 +1758,9 @@ void wifi_init_task(){
     );
 
     if (bits & WIFI_CONNECTED_BIT) {
-        // uint8_t mac[6];
-        // esp_err_t err = esp_efuse_mac_get_default(mac);
-        // if(err != ESP_OK){
-        //     ESP_LOGE("MAC", "Get Mac address failed\n");
-        // }else{
-        //     snprintf(MAC, sizeof(MAC), "%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-        //     ESP_LOGI("MAC", "MAC Address is: %s", MAC);
-        //     websocket_init_task();
-        // }
-        http_response_t* response = auth_http_request();
-        if(response){
-            free(response->data_buffer);
-            free(response);
-            websocket_init_task();
+        char* access_token = auth_http_request();
+        if(access_token){
+            websocket_init_task(access_token);
         }
 
     }
