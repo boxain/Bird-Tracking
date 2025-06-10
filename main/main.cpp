@@ -49,7 +49,7 @@ static int s_retry_num = 0;
 static EventGroupHandle_t s_wifi_event_group;
 
 // SERVER SETTING
-#define SERVER_HOST "http://192.168.1.103:8000"
+#define SERVER_HOST "http://192.168.1.100:8000"
 
 // HTTP SETTING
 #define AUTH_HTTP_PATH "api/device"
@@ -60,7 +60,7 @@ typedef struct {
 } http_response_t;
 
 // WEBSOCKET SETTING
-#define WEBSOCKET_HOST "ws://192.168.1.103:8000"
+#define WEBSOCKET_HOST "ws://192.168.1.100:8000"
 #define WEBSOCKET_PATH "api/device/ws"
 #define NO_DATA_TIMEOUT_SEC 43200 // 30 Days
 static char MAC[18];
@@ -75,14 +75,13 @@ enum StatusType {
 
 // WEBSOCKET Action
 enum ActionType {
-    ACTION_START_INFERENCE,
-    ACTION_STOP_INFERENCE,
-    ACTION_RETURN_INFERENCE,
-    ACTION_MODE_SWITCH,
     ACTION_OTA,
-    ACTION_MODEL_DOWNLOAD,
+    ACTION_INIT,
+    ACTION_LOG_INFO,
+    ACTION_MODE_SWITCH,
     ACTION_MODEL_SWITCH,
-    ACTION_LOG_INFO
+    ACTION_MODEL_DOWNLOAD,
+    ACTION_RETURN_INFERENCE,
 };
 
 // WEBSOCKET RECEIVED MESSAGE QUEUE
@@ -278,7 +277,6 @@ static void model_init(char* model_id, char* task_id){
     if(xSemaphoreTake(g_model_mutex, portMAX_DELAY) == pdTRUE){
         char path[128];
         sprintf(path, "%s/%s/%s/%s.espdl", MOUNT_POINT, "models", model_id, model_id);
-
         ESP_LOGI("MODEL SWITCH", "Starting model switch, path: %s", path);
 
         // Release old model 
@@ -289,27 +287,33 @@ static void model_init(char* model_id, char* task_id){
 
         // Must setting FAT LFN ( Long File Name)
         model = new CatDetect(path);
-        websocket_sending_message_t sending_msg = {0};
         if(model){
             ESP_LOGI("MODEL SWITCH", "Success");
-
             // Sending completed message
-            sending_msg.op_code = 0x01;
-            sending_msg.action = ACTION_MODEL_SWITCH;
-            sending_msg.status = STATUS_COMPLETED;
-            strncpy(sending_msg.task_id, task_id, TASK_ID_MAX_LEN-1);
-            sending_msg.task_id[TASK_ID_MAX_LEN-1] = '\0';
-            xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
+            // Cause `INIT` task does not contain task_id, so we need to check task_id is NULL or not.
+            if(task_id != NULL){
+                websocket_sending_message_t sending_msg = {0};
+                sending_msg.op_code = 0x01;
+                sending_msg.action = ACTION_MODEL_SWITCH;
+                sending_msg.status = STATUS_COMPLETED;
+                strncpy(sending_msg.task_id, task_id, TASK_ID_MAX_LEN-1);
+                sending_msg.task_id[TASK_ID_MAX_LEN-1] = '\0';
+                xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
+            }
 
         }else{
             ESP_LOGE("MODEL SWITCH", "Failed");
             // Sending error message
-            sending_msg.op_code = 0x01;
-            sending_msg.action = ACTION_MODEL_SWITCH;
-            sending_msg.status = STATUS_ERROR;
-            strncpy(sending_msg.task_id, task_id, TASK_ID_MAX_LEN-1);
-            sending_msg.task_id[TASK_ID_MAX_LEN-1] = '\0';
-            xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
+            // Cause `INIT` task does not contain task_id, so we need to check task_id is NULL or not.
+            if(task_id != NULL){
+                websocket_sending_message_t sending_msg = {0};
+                sending_msg.op_code = 0x01;
+                sending_msg.action = ACTION_MODEL_SWITCH;
+                sending_msg.status = STATUS_ERROR;
+                strncpy(sending_msg.task_id, task_id, TASK_ID_MAX_LEN-1);
+                sending_msg.task_id[TASK_ID_MAX_LEN-1] = '\0';
+                xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
+            }
             // unmount partition and disable SDMMC peripheral
             // esp_vfs_fat_sdcard_unmount(MOUNT_POINT, card);
             // ESP_LOGI("SD Card", "Card unmounted");
@@ -387,13 +391,13 @@ static esp_err_t check_file_is_exist(char* model_id){
 
 static char* action_enum_to_string(ActionType action){
     switch (action) {
-        case ACTION_START_INFERENCE: return "START_INFERENCE";
-        case ACTION_STOP_INFERENCE: return"STOP_INFERENCE";
         case ACTION_RETURN_INFERENCE: return "INFERENCE_RESULT";
         case ACTION_MODE_SWITCH: return "MODE_SWITCH";
         case ACTION_MODEL_DOWNLOAD: return "MODEL_DOWNLOAD";
         case ACTION_MODEL_SWITCH: return "MODEL_SWITCH";
+        case ACTION_LOG_INFO: return "LOG";
         case ACTION_OTA: return "OTA";
+        case ACTION_INIT: return "INIT";
         default: return "UNKNOWN_ACTION";   
     }
 }
@@ -458,8 +462,9 @@ static char* control_message2json(ActionType action, StatusType status, char* ta
     cJSON* root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "action", action_str);
     cJSON_AddStringToObject(root, "status", status_str);
-    cJSON_AddStringToObject(root, "task_id", task_id);
-
+    if(task_id != NULL){
+        cJSON_AddStringToObject(root, "task_id", task_id);
+    }
     char* result = cJSON_Print(root);
     cJSON_Delete(root);
     return result;
@@ -786,13 +791,17 @@ static void mode_switch(char* mode, char* task_id){
 
         xSemaphoreGive(g_mode_mutex);
         ESP_LOGI("MODE SWITCH", "Switch complete");
-        websocket_sending_message_t sending_msg = {0};
-        sending_msg.op_code = 0x01;
-        sending_msg.action = ACTION_MODE_SWITCH;
-        sending_msg.status = STATUS_COMPLETED;
-        strncpy(sending_msg.task_id, task_id, TASK_ID_MAX_LEN-1);
-        sending_msg.task_id[TASK_ID_MAX_LEN-1] = '\0';
-        xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
+
+        // Cause `INIT` task does not contain task_id, so we need to check task_id is NULL or not.
+        if(task_id != NULL){
+            websocket_sending_message_t sending_msg = {0};
+            sending_msg.op_code = 0x01;
+            sending_msg.action = ACTION_MODE_SWITCH;
+            sending_msg.status = STATUS_COMPLETED;
+            strncpy(sending_msg.task_id, task_id, TASK_ID_MAX_LEN-1);
+            sending_msg.task_id[TASK_ID_MAX_LEN-1] = '\0';
+            xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
+        }
     }
 }
 
@@ -820,7 +829,31 @@ static void websocket_process_task(void* pvParameters){
                         ESP_LOGI("Websocket", "Task: %s", action->valuestring);
                         websocket_sending_message_t sending_msg = {0};
                         
-                        if(strcmp(action->valuestring, "MODE_SWITCH") == 0){
+                        if(strcmp(action->valuestring, "INIT") == 0){
+                            
+ 
+                            cJSON* parsed_mode = cJSON_GetObjectItem(msg_json, "mode");
+                            cJSON* parsed_model_id = cJSON_GetObjectItem(msg_json, "model_id");
+                                                        
+                            if(parsed_mode != NULL && cJSON_IsString(parsed_mode) && parsed_mode->valuestring != NULL){
+                                mode_switch(parsed_mode->valuestring, NULL);
+                            }
+
+                            if(parsed_model_id != NULL && cJSON_IsString(parsed_model_id) && parsed_model_id->valuestring != NULL){
+                                esp_err_t is_file_exist = check_file_is_exist(parsed_model_id->valuestring);
+                                if(is_file_exist == ESP_FAIL){
+                                    ESP_LOGE("MODEL_SWITCH","file does not exist.");
+                                }else{
+                                    model_switch(parsed_model_id->valuestring, NULL);
+                                }
+                            }
+
+                            sending_msg.action = ACTION_INIT;
+                            sending_msg.status = STATUS_COMPLETED;
+                            sending_msg.op_code = 0x01;
+                            xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
+
+                        }else if(strcmp(action->valuestring, "MODE_SWITCH") == 0){
                             
                             sending_msg.action = ACTION_MODE_SWITCH;
                             sending_msg.status = STATUS_RECEIVED;
