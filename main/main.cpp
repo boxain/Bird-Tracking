@@ -77,12 +77,20 @@ enum StatusType {
 enum ActionType {
     ACTION_OTA,
     ACTION_INIT,
-    ACTION_LOG_INFO,
+    ACTION_LOG,
     ACTION_MODE_SWITCH,
     ACTION_MODEL_SWITCH,
     ACTION_MODEL_DOWNLOAD,
     ACTION_RETURN_INFERENCE,
 };
+
+// LOG Level
+enum LogType {
+    LOG_LEVEL_INFO,
+    LOG_LEVEL_WARNING,
+    LOG_LEVEL_ERROR
+};
+
 
 // WEBSOCKET RECEIVED MESSAGE QUEUE
 static QueueHandle_t  websocket_received_message_queue;
@@ -103,6 +111,7 @@ typedef struct {
     size_t image_len;
     std::list<dl::detect::result_t>* inference_result;
     StatusType status;
+    char* text_payload;
 } websocket_sending_message_t;
 
 // HTTP Client
@@ -228,6 +237,7 @@ static SemaphoreHandle_t g_mode_mutex;
 #define EVT_GBP__BIT_MODEL_DOWNLOAD_IN_COMPLETED BIT5
 #define EVT_GBP__BIT_MODEL_SWITCH_IN_PROGRESS BIT6
 #define EVT_GBP__BIT_MODEL_SWITCH_COMPLETED BIT7
+#define EVT_GRP__BIT_WEBSOCKET_CONNECTED BIT8
 #define ALL_IN_PROGRESS_BITS (EVT_GBP__BIT_OTA_IN_PROGRESS | EVT_GBP__BIT_MODEL_DOWNLOAD_IN_PROGRESS | EVT_GBP__BIT_MODEL_SWITCH_IN_PROGRESS)
 #define ALL_COMPLETED_BITS (EVT_GBP__BIT_OTA_COMPLETED | EVT_GBP__BIT_MODEL_DOWNLOAD_IN_COMPLETED | EVT_GBP__BIT_MODEL_SWITCH_COMPLETED)
 
@@ -243,6 +253,130 @@ typedef struct {
     char* download_path;
     char task_id[TASK_ID_MAX_LEN];
 } ota_params_t ;
+
+
+
+static char* action_enum_to_string(ActionType action){
+    switch (action) {
+        case ACTION_RETURN_INFERENCE: return "INFERENCE_RESULT";
+        case ACTION_MODE_SWITCH: return "MODE_SWITCH";
+        case ACTION_MODEL_DOWNLOAD: return "MODEL_DOWNLOAD";
+        case ACTION_MODEL_SWITCH: return "MODEL_SWITCH";
+        case ACTION_LOG: return "LOG";
+        case ACTION_OTA: return "OTA";
+        case ACTION_INIT: return "INIT";
+        default: return "UNKNOWN_ACTION";   
+    }
+}
+
+
+
+static char* status_enum_to_string(StatusType status){
+    switch (status) {
+        case STATUS_ERROR: return "ERROR";
+        case STATUS_RECEIVED: return "RECEIVED";
+        case STATUS_COMPLETED: return "COMPLETED";
+        default: return "UNKNOWN_STATUS";
+    }
+}
+
+
+
+static char* log_enum_to_string(LogType level){
+    switch (level) {
+        case LOG_LEVEL_INFO: return "INFO";
+        case LOG_LEVEL_WARNING: return "WARNING";
+        case LOG_LEVEL_ERROR: return "ERROR";
+        default: return "UNKNOWN_LEVEL";
+    }
+}
+
+
+
+static void send_log_to_server(ActionType action, LogType level, const char* tag, const char* format, ...){
+    char* action_str = action_enum_to_string(action);
+    char* level_str = log_enum_to_string(level);
+    char message[256];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(message, sizeof(message), format, args);
+    va_end(args);
+
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "action", action_str);
+    cJSON_AddStringToObject(root, "level", level_str);
+    cJSON_AddStringToObject(root, "message", message);
+
+    char* json_string = cJSON_Print(root);
+    cJSON_Delete(root);
+
+    websocket_sending_message_t log_mes = {0};
+    log_mes.action = ACTION_LOG;
+    log_mes.text_payload = json_string;
+    if (xQueueSend(websocket_sending_message_queue, &log_mes, pdMS_TO_TICKS(100)) != pdPASS) {
+        ESP_LOGE("LOG_SENDER", "Failed to queue log message, freeing memory.");
+        free(json_string);
+    }
+}
+
+
+
+static char* inference_message2json(ActionType action, StatusType status, std::list<dl::detect::result_t>* inference_results){
+    // Root
+    char* action_str = action_enum_to_string(action);
+    char* status_str = status_enum_to_string(status);
+
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "action", action_str);
+    cJSON_AddStringToObject(root, "status", status_str);
+
+    // Content
+    cJSON* content = cJSON_CreateObject();
+    cJSON* result_array = cJSON_AddArrayToObject(content, "inference_results");
+
+    if(inference_results != NULL){
+        for(const auto& inference_result: *inference_results){
+
+            cJSON* result = cJSON_CreateObject();
+            cJSON_AddNumberToObject(result, "category", inference_result.category);
+            cJSON_AddNumberToObject(result, "score", inference_result.score);
+            cJSON* box = cJSON_AddArrayToObject(result, "box");
+
+            cJSON_AddItemToArray(box, cJSON_CreateNumber(inference_result.box[0]));
+            cJSON_AddItemToArray(box, cJSON_CreateNumber(inference_result.box[1]));
+            cJSON_AddItemToArray(box, cJSON_CreateNumber(inference_result.box[2]));
+            cJSON_AddItemToArray(box, cJSON_CreateNumber(inference_result.box[3]));
+                
+            cJSON_AddItemToArray(result_array, result);
+            
+        }
+    }
+
+    cJSON_AddItemToObject(root, "content", content);
+    char* result = cJSON_Print(root);
+    cJSON_Delete(root);
+    return result;
+    
+}
+
+
+
+static char* control_message2json(ActionType action, StatusType status, char* task_id){
+    char* action_str = action_enum_to_string(action);
+    char* status_str = status_enum_to_string(status);
+
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "action", action_str);
+    cJSON_AddStringToObject(root, "status", status_str);
+    if(task_id != NULL){
+        cJSON_AddStringToObject(root, "task_id", task_id);
+    }
+    char* result = cJSON_Print(root);
+    cJSON_Delete(root);
+    return result;
+}
+
+
 
 static std::list<dl::detect::result_t> model_inference(uint8_t* image, size_t len){
     dl::image::jpeg_img_t jpeg_img = {.data = (void *)image, .data_len = len};
@@ -303,6 +437,7 @@ static void model_init(char* model_id, char* task_id){
 
         }else{
             ESP_LOGE("MODEL SWITCH", "Failed");
+            send_log_to_server(ACTION_LOG, LOG_LEVEL_ERROR, "MODEL", "Model switch failed for model_id: %s", model_id);
             // Sending error message
             // Cause `INIT` task does not contain task_id, so we need to check task_id is NULL or not.
             if(task_id != NULL){
@@ -389,99 +524,30 @@ static esp_err_t check_file_is_exist(char* model_id){
 
 
 
-static char* action_enum_to_string(ActionType action){
-    switch (action) {
-        case ACTION_RETURN_INFERENCE: return "INFERENCE_RESULT";
-        case ACTION_MODE_SWITCH: return "MODE_SWITCH";
-        case ACTION_MODEL_DOWNLOAD: return "MODEL_DOWNLOAD";
-        case ACTION_MODEL_SWITCH: return "MODEL_SWITCH";
-        case ACTION_LOG_INFO: return "LOG";
-        case ACTION_OTA: return "OTA";
-        case ACTION_INIT: return "INIT";
-        default: return "UNKNOWN_ACTION";   
-    }
-}
-
-
-
-static char* status_enum_to_string(StatusType status){
-    switch (status) {
-        case STATUS_ERROR: return "ERROR";
-        case STATUS_RECEIVED: return "RECEIVED";
-        case STATUS_COMPLETED: return "COMPLETED";
-        default: return "UNKNOWN_STATUS";
-    }
-}
-
-
-
-static char* inference_message2json(ActionType action, StatusType status, std::list<dl::detect::result_t>* inference_results){
-    // Root
-    char* action_str = action_enum_to_string(action);
-    char* status_str = status_enum_to_string(status);
-
-    cJSON* root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "action", action_str);
-    cJSON_AddStringToObject(root, "status", status_str);
-
-    // Content
-    cJSON* content = cJSON_CreateObject();
-    cJSON* result_array = cJSON_AddArrayToObject(content, "inference_results");
-
-    if(inference_results != NULL){
-        for(const auto& inference_result: *inference_results){
-
-            cJSON* result = cJSON_CreateObject();
-            cJSON_AddNumberToObject(result, "category", inference_result.category);
-            cJSON_AddNumberToObject(result, "score", inference_result.score);
-            cJSON* box = cJSON_AddArrayToObject(result, "box");
-
-            cJSON_AddItemToArray(box, cJSON_CreateNumber(inference_result.box[0]));
-            cJSON_AddItemToArray(box, cJSON_CreateNumber(inference_result.box[1]));
-            cJSON_AddItemToArray(box, cJSON_CreateNumber(inference_result.box[2]));
-            cJSON_AddItemToArray(box, cJSON_CreateNumber(inference_result.box[3]));
-                
-            cJSON_AddItemToArray(result_array, result);
-            
-        }
-    }
-
-    cJSON_AddItemToObject(root, "content", content);
-    char* result = cJSON_Print(root);
-    cJSON_Delete(root);
-    return result;
-    
-}
-
-
-
-static char* control_message2json(ActionType action, StatusType status, char* task_id){
-    char* action_str = action_enum_to_string(action);
-    char* status_str = status_enum_to_string(status);
-
-    cJSON* root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "action", action_str);
-    cJSON_AddStringToObject(root, "status", status_str);
-    if(task_id != NULL){
-        cJSON_AddStringToObject(root, "task_id", task_id);
-    }
-    char* result = cJSON_Print(root);
-    cJSON_Delete(root);
-    return result;
-}
-
-
-
 static void websocket_sending_task(void* pvParameters){
     websocket_sending_message_t msg;
     while(1){
-        // Consider add thread block
+        
+        // Waiting for websocket connected
+        ESP_LOGI("WS_SENDER", "Waiting for websocket connection bit...");
+        xEventGroupWaitBits(
+            g_system_event_group,
+            EVT_GRP__BIT_WEBSOCKET_CONNECTED,
+            pdFALSE,
+            pdFALSE,
+            portMAX_DELAY
+        );
+        
         if(xQueueReceive(websocket_sending_message_queue, &msg, portMAX_DELAY) == pdTRUE){
             ESP_LOGI("Websocket Sending Task", "Sending message (type: %d)", msg.op_code);
             
-            // If is Control Message
-            if(msg.op_code == 0x01){
-
+            if(msg.action == ACTION_LOG){
+                if(msg.text_payload != NULL){
+                    esp_websocket_client_send_text(websocket_client, msg.text_payload, strlen(msg.text_payload), portMAX_DELAY);
+                    free(msg.text_payload);
+                }
+            }else if(msg.op_code == 0x01){
+                // If is Control Message
                 char* serialized_message = control_message2json(msg.action, msg.status, msg.task_id);
                 if(serialized_message != NULL){
                     int len = strlen(serialized_message);
@@ -489,8 +555,7 @@ static void websocket_sending_task(void* pvParameters){
                     free(serialized_message);
                 }
             }else{
-            // If is Inference Message
-
+                // If is Inference Message
                 char* serialized_message = inference_message2json(msg.action, msg.status, msg.inference_result);
                 if (msg.inference_result != NULL) {
                     delete msg.inference_result;
@@ -607,6 +672,7 @@ static void model_download_task(void *pvParameter){
     websocket_sending_message_t sending_msg = {0};
     if(ret == ESP_OK){
         ESP_LOGI("MODEL_DOWNLOAD", "Success");
+        send_log_to_server(ACTION_LOG, LOG_LEVEL_INFO, "DOWNLOAD", "Model download completed.");
         // Sending completed message
         sending_msg.op_code = 0x01;
         sending_msg.action = ACTION_MODEL_DOWNLOAD;
@@ -621,6 +687,7 @@ static void model_download_task(void *pvParameter){
     }else{
         ESP_LOGE("MODEL_DOWNLOAD", "Failed");
         ESP_LOGE("MODEL_DOWNLOAD", "Failed reason: %s", esp_err_to_name(ret));
+        send_log_to_server(ACTION_LOG, LOG_LEVEL_ERROR, "DOWNLOAD", "Model download failed. Reason: %s", esp_err_to_name(ret));
 
         // Sending error message
         sending_msg.op_code = 0x01;
@@ -696,7 +763,7 @@ void ota_task(void *pvParameter){
     websocket_sending_message_t sending_msg = {0};
     if(ret == ESP_OK){
         ESP_LOGI("OTA", "OTA Succed, Rebooting");
-
+        send_log_to_server(ACTION_LOG, LOG_LEVEL_ERROR, "DOWNLOAD", "Firmware download success, waiting for reboot.");
         // Sending completed message
         sending_msg.op_code = 0x01;
         sending_msg.action = ACTION_OTA;
@@ -710,6 +777,7 @@ void ota_task(void *pvParameter){
     }else{
         ESP_LOGI("OTA", "Firmware upgrade failed");
         ESP_LOGW("OTA", "Failed reason: %s", esp_err_to_name(ret));
+        send_log_to_server(ACTION_LOG, LOG_LEVEL_ERROR, "DOWNLOAD", "Firmware download failed. Reason: %s", esp_err_to_name(ret));
 
         // Sending error message
         sending_msg.op_code = 0x01;
@@ -823,6 +891,7 @@ static void websocket_process_task(void* pvParameters){
                 cJSON* msg_json = cJSON_Parse(msg.data);
                 if(msg_json == NULL) {
                     ESP_LOGE("Websocket", "Fail to sparse message into json format");
+                    send_log_to_server(ACTION_LOG, LOG_LEVEL_ERROR, "PARSER", "Failed to parse incoming JSON message.");
                 }else{
                     cJSON* action = cJSON_GetObjectItem(msg_json, "action");
                     if(action && cJSON_IsString(action)) {
@@ -852,6 +921,7 @@ static void websocket_process_task(void* pvParameters){
                             sending_msg.status = STATUS_COMPLETED;
                             sending_msg.op_code = 0x01;
                             xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
+                            send_log_to_server(ACTION_LOG, LOG_LEVEL_INFO, "INIT", "Init connection successfully.");
 
                         }else if(strcmp(action->valuestring, "MODE_SWITCH") == 0){
                             
@@ -862,14 +932,16 @@ static void websocket_process_task(void* pvParameters){
                             cJSON* parsed_task_id = cJSON_GetObjectItem(msg_json, "task_id");
                             
                             if(parsed_mode == NULL){
-                                ESP_LOGW("MODE_SWITCH", "Mode does not exist.");                       
+                                ESP_LOGW("MODE_SWITCH", "Mode does not exist.");
+                                send_log_to_server(ACTION_LOG, LOG_LEVEL_WARNING, "PARSER", "Task '%s' is missing 'mode'.", "MODE_SWITCH");                      
                                 sending_msg.status = STATUS_ERROR;
                                 xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
                                 continue;
                             }
 
                             if(parsed_task_id == NULL){
-                                ESP_LOGW("MODE_SWITCH", "task_id does not exist.");                       
+                                ESP_LOGW("MODE_SWITCH", "task_id does not exist.");
+                                send_log_to_server(ACTION_LOG, LOG_LEVEL_WARNING, "PARSER", "Task '%s' is missing 'task_id'.", "MODE_SWITCH");                     
                                 sending_msg.status = STATUS_ERROR;
                                 xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
                                 continue;
@@ -898,7 +970,8 @@ static void websocket_process_task(void* pvParameters){
 
                             cJSON* parsed_task_id = cJSON_GetObjectItem(msg_json, "task_id");
                             if(parsed_task_id == NULL){
-                                ESP_LOGW("MODE_SWITCH", "task_id does not exist.");                       
+                                ESP_LOGW("MODEL_DOWNLOAD", "task_id does not exist.");
+                                send_log_to_server(ACTION_LOG, LOG_LEVEL_WARNING, "PARSER", "Task '%s' is missing 'task_id'.", "MODEL_DOWNLOAD");                        
                                 sending_msg.status = STATUS_ERROR;
                                 xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
                                 continue;
@@ -908,6 +981,7 @@ static void websocket_process_task(void* pvParameters){
                             // If message does not contain download path, return error
                             if(parsed_download_path == NULL){
                                 ESP_LOGW("MODEL_DEPLOYMENT","Download path does not exist.");
+                                send_log_to_server(ACTION_LOG, LOG_LEVEL_WARNING, "PARSER", "Task '%s' is missing 'download_path'.", "MODEL_DEPLOYMENT"); 
                                 sending_msg.status = STATUS_ERROR;
                                 xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
                                 free(params);
@@ -933,6 +1007,7 @@ static void websocket_process_task(void* pvParameters){
                             // if message does not contain model id, return error
                             if(parsed_model_id == NULL){
                                 ESP_LOGW("MODEL_DEPLOYMENT","model_id does not exist.");
+                                send_log_to_server(ACTION_LOG, LOG_LEVEL_WARNING, "PARSER", "Task '%s' is missing 'model_id'.", "MODEL_DEPLOYMENT"); 
                                 sending_msg.status = STATUS_ERROR;
                                 xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
                                 free(params);
@@ -979,6 +1054,7 @@ static void websocket_process_task(void* pvParameters){
                             cJSON* parsed_model_id = cJSON_GetObjectItem(msg_json, "model_id");
                             if(parsed_model_id == NULL){
                                 ESP_LOGE("MODEL_SWITCH","model_id does not exist.");
+                                send_log_to_server(ACTION_LOG, LOG_LEVEL_WARNING, "PARSER", "Task '%s' is missing 'model_id'.", "MODEL_SWITCH");
                                 sending_msg.status = STATUS_ERROR;
                                 xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
                                 continue;
@@ -986,7 +1062,8 @@ static void websocket_process_task(void* pvParameters){
 
                             cJSON* parsed_task_id = cJSON_GetObjectItem(msg_json, "task_id");
                             if(parsed_task_id == NULL){
-                                ESP_LOGW("MODE_SWITCH", "task_id does not exist.");                       
+                                ESP_LOGW("MODEL_SWITCH", "task_id does not exist.");      
+                                send_log_to_server(ACTION_LOG, LOG_LEVEL_WARNING, "PARSER", "Task '%s' is missing 'task_id'.", "MODEL_SWITCH");                 
                                 sending_msg.status = STATUS_ERROR;
                                 xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
                                 continue;
@@ -995,6 +1072,7 @@ static void websocket_process_task(void* pvParameters){
                             esp_err_t is_file_exist = check_file_is_exist(parsed_model_id->valuestring);
                             if(is_file_exist == ESP_FAIL){
                                 ESP_LOGE("MODEL_SWITCH","file does not exist.");
+                                send_log_to_server(ACTION_LOG, LOG_LEVEL_WARNING, "PARSER", "Task '%s' does not exist the corrosponding model file.", "MODEL_SWITCH");
                                 sending_msg.status = STATUS_ERROR;
                                 xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
                                 continue;
@@ -1017,6 +1095,7 @@ static void websocket_process_task(void* pvParameters){
                             // If message does not contain download path, return error
                             if(parsed_download_path == NULL){
                                 ESP_LOGW("OTA","Download path does not exist.");
+                                send_log_to_server(ACTION_LOG, LOG_LEVEL_WARNING, "PARSER", "Task '%s' is missing 'download_path'.", "OTA"); 
                                 sending_msg.status = STATUS_ERROR;
                                 xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
                                 continue;
@@ -1024,7 +1103,8 @@ static void websocket_process_task(void* pvParameters){
 
                             cJSON* parsed_task_id = cJSON_GetObjectItem(msg_json, "task_id");
                             if(parsed_task_id == NULL){
-                                ESP_LOGW("MODE_SWITCH", "task_id does not exist.");                       
+                                ESP_LOGW("OTA", "task_id does not exist.");
+                                send_log_to_server(ACTION_LOG, LOG_LEVEL_WARNING, "PARSER", "Task '%s' is missing 'task_id'.", "OTA");                      
                                 sending_msg.status = STATUS_ERROR;
                                 xQueueSend(websocket_sending_message_queue, &sending_msg, portMAX_DELAY);
                                 continue;
@@ -1062,13 +1142,14 @@ static void websocket_process_task(void* pvParameters){
                             ota_update(params);
 
                         }else if(strcmp(action->valuestring, "RESET") == 0){
+                            send_log_to_server(ACTION_LOG, LOG_LEVEL_WARNING, "PARSER", "Start reset device."); 
                             esp_restart();
                         }else{
                             ESP_LOGW("Websocket", "Invalid task name");
                         }
                         
                     }else{
-                        ESP_LOGE("Websocket", "Message isn't right format");
+                        send_log_to_server(ACTION_LOG, LOG_LEVEL_WARNING, "PARSER", "Received invalid task name: %s", action->valuestring);
                     }
                     cJSON_Delete(msg_json);
                 }
@@ -1091,6 +1172,7 @@ static void take_picture(){
     camera_fb_t* pic = esp_camera_fb_get();
     if(pic == NULL){
         ESP_LOGE("Camera", "Take picture failed");
+        send_log_to_server(ACTION_LOG, LOG_LEVEL_WARNING, "CAMERA", "Failed to capture picture frame.");
         return;
     }
     
@@ -1156,7 +1238,10 @@ static void take_picture(){
 static void camera_control_task(void* pvParameters){
     if(ESP_OK != init_camera()){
         ESP_LOGE("Camera", "INIT failed");
+        send_log_to_server(ACTION_LOG, LOG_LEVEL_ERROR, "CAMERA", "Camera init failed.");
         vTaskDelete(NULL);
+    }else{
+        send_log_to_server(ACTION_LOG, LOG_LEVEL_INFO, "CAMERA", "Camera init success.");
     }
 
     while(1) {
@@ -1224,9 +1309,11 @@ static void websocket_handler(void *handler_args, esp_event_base_t base, int32_t
             break;
         case WEBSOCKET_EVENT_CONNECTED:
             ESP_LOGI("Websocket", "WEBSOCKET_EVENT_CONNECTED");
+            xEventGroupSetBits(g_system_event_group, EVT_GRP__BIT_WEBSOCKET_CONNECTED);
             break;
         case WEBSOCKET_EVENT_DISCONNECTED:
             ESP_LOGI("Websocket", "WEBSOCKET_EVENT_DISCONNECTED");
+            xEventGroupClearBits(g_system_event_group, EVT_GRP__BIT_WEBSOCKET_CONNECTED);
             if (data->error_handle.error_type == WEBSOCKET_ERROR_TYPE_TCP_TRANSPORT) {
                 log_error_if_nonzero("reported from esp-tls", data->error_handle.esp_tls_last_esp_err);
                 log_error_if_nonzero("reported from tls stack", data->error_handle.esp_tls_stack_err);
@@ -1305,44 +1392,6 @@ static void websocket_init_task(char* access_token){
     // https://docs.espressif.com/projects/esp-idf/zh_CN/v5.4/esp32/api-reference/system/esp_event.html
     esp_websocket_register_events(websocket_client, WEBSOCKET_EVENT_ANY, websocket_handler, (void*)websocket_client);
     esp_websocket_client_start(websocket_client);
-
-    // Create websocket message queue
-    websocket_received_message_queue = xQueueCreate(10, sizeof(websocket_received_message_t));
-    if (websocket_received_message_queue == NULL) {
-        ESP_LOGE("Websocket", "Failed to create received message queue");
-        vTaskDelete(NULL);
-    }
-    websocket_sending_message_queue = xQueueCreate(20, sizeof(websocket_sending_message_t));
-    if (websocket_sending_message_queue == NULL) {
-        ESP_LOGE("Websocket", "Failed to create sending message queue");
-        vTaskDelete(NULL);
-    }
-
-    // Create RTOS event group and semaphore
-    g_system_event_group = xEventGroupCreate();
-    g_mode_mutex = xSemaphoreCreateBinary();
-    g_model_mutex = xSemaphoreCreateBinary();
-
-    if(g_mode_mutex == NULL){
-        ESP_LOGE("Semaphore", "mode mutext create failed...");
-    }else{
-        xSemaphoreGive(g_mode_mutex);
-    }
-
-    if(g_model_mutex == NULL){
-        ESP_LOGE("Semaphore", "model mutext create failed...");
-    }else{
-        xSemaphoreGive(g_model_mutex);
-    }
-
-    if(g_system_event_group == NULL){
-        ESP_LOGE("Event Group", "create failed...");
-    }
-
-    // Create websocket process task
-    xTaskCreatePinnedToCore(websocket_process_task,"Websocket process task", 4096, NULL, 4, NULL, tskNO_AFFINITY);
-    xTaskCreatePinnedToCore(websocket_sending_task, "Websocket sending task", 4096, NULL, 4, NULL, tskNO_AFFINITY);
-    xTaskCreatePinnedToCore(camera_control_task, "Camera control task", 4096, NULL, 2, NULL, tskNO_AFFINITY);
 }
 
 
@@ -1430,9 +1479,9 @@ static void sdmmc_card_init_task(){
 
     if(ret != ESP_OK){
         if(ret == ESP_FAIL){
-            ESP_LOGE("SD Card", "Failed to mount filesystem.");
+            send_log_to_server(ACTION_LOG, LOG_LEVEL_ERROR, "SD card", "Failed to mount filesystem. Code: %s", esp_err_to_name(ret));
         }else{
-            ESP_LOGE("SD Card", "Failed to initialize the card (%s). Error Number: (%s)", 
+            send_log_to_server(ACTION_LOG, LOG_LEVEL_ERROR, "SD card", "Failed to initialize the card (%s). Error Number: (%s)", 
                 "Make sure SD card lines have pull-up resistors in place.", esp_err_to_name(ret));
 #ifdef CONFIG_EXAMPLE_DEBUG_PIN_CONNECTIONS
             check_sd_card_pins(&config, pin_count);
@@ -1441,7 +1490,7 @@ static void sdmmc_card_init_task(){
         return;
     }
     // Card has been initialized, print its properties
-    ESP_LOGI("SD Card", "Filesystem mounted");
+    send_log_to_server(ACTION_LOG, LOG_LEVEL_INFO, "SD card", "Filesystem mounted.");
     sdmmc_card_print_info(stdout, card);
 }
 
@@ -1496,6 +1545,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
                     s_retry_num++;
                     esp_wifi_connect();
                 }else{
+                    send_log_to_server(ACTION_LOG, LOG_LEVEL_WARNING, "WIFI", "Disconnected from AP, max retries reached.");
                     xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
                 }
                 ESP_LOGI("WIFI", "Wifi station connect to the AP fail.\n");
@@ -1513,6 +1563,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
     }else if(event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP ) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*)event_data;
         ESP_LOGI("IP Event", "Got ip:" IPSTR, IP2STR(&event->ip_info.ip));
+        send_log_to_server(ACTION_LOG, LOG_LEVEL_INFO, "WIFI", "Connected to AP, IP: %s", IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     
@@ -1725,6 +1776,7 @@ static char* auth_http_request(){
     }else{
         ESP_LOGE("AUTH_HTTP_REQUEST", "Failed");
         ESP_LOGE("AUTH_HTTP_REQUEST", "Failed reason: %s", esp_err_to_name(ret));
+        send_log_to_server(ACTION_LOG, LOG_LEVEL_ERROR, "AUTH", "HTTP auth request failed. Code: %s", esp_err_to_name(ret));
         if(params->data_buffer != NULL){
             free(params->data_buffer);
         }
@@ -1843,6 +1895,7 @@ static void print_sha256(const uint8_t* image_hash, const char* label){
         sprintf(&hash_print[i*2], "%02x", image_hash[i]);
     }
     ESP_LOGI("OTA", "%s %s", label, hash_print);
+    send_log_to_server(ACTION_LOG, LOG_LEVEL_INFO, "OTA", "%s %s", label, hash_print);
 }
 
 
@@ -1861,6 +1914,48 @@ static void get_sha256_of_partitions(void){
 
 
 
+static void application_rtos_init(){
+    // Create websocket message queue
+    websocket_received_message_queue = xQueueCreate(10, sizeof(websocket_received_message_t));
+    if (websocket_received_message_queue == NULL) {
+        ESP_LOGE("Websocket", "Failed to create received message queue");
+        vTaskDelete(NULL);
+    }
+    websocket_sending_message_queue = xQueueCreate(20, sizeof(websocket_sending_message_t));
+    if (websocket_sending_message_queue == NULL) {
+        ESP_LOGE("Websocket", "Failed to create sending message queue");
+        vTaskDelete(NULL);
+    }
+
+    // Create RTOS event group and semaphore
+    g_system_event_group = xEventGroupCreate();
+    g_mode_mutex = xSemaphoreCreateBinary();
+    g_model_mutex = xSemaphoreCreateBinary();
+
+    if(g_mode_mutex == NULL){
+        ESP_LOGE("Semaphore", "mode mutext create failed...");
+    }else{
+        xSemaphoreGive(g_mode_mutex);
+    }
+
+    if(g_model_mutex == NULL){
+        ESP_LOGE("Semaphore", "model mutext create failed...");
+    }else{
+        xSemaphoreGive(g_model_mutex);
+    }
+
+    if(g_system_event_group == NULL){
+        ESP_LOGE("Event Group", "create failed...");
+    }
+
+    // Create websocket process task
+    xTaskCreatePinnedToCore(websocket_process_task,"Websocket process task", 4096, NULL, 4, NULL, tskNO_AFFINITY);
+    xTaskCreatePinnedToCore(websocket_sending_task, "Websocket sending task", 4096, NULL, 4, NULL, tskNO_AFFINITY);
+    xTaskCreatePinnedToCore(camera_control_task, "Camera control task", 4096, NULL, 2, NULL, tskNO_AFFINITY);
+}
+
+
+
 extern "C" void app_main(void){
     /**
      * 1. customize model init class
@@ -1870,6 +1965,7 @@ extern "C" void app_main(void){
      * 5. split code
      */
     // power_management_init();
+    application_rtos_init();
     nvs_init();
     sdmmc_card_init_task();
     get_sha256_of_partitions();
