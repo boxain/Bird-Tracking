@@ -49,7 +49,7 @@ static int s_retry_num = 0;
 static EventGroupHandle_t s_wifi_event_group;
 
 // SERVER SETTING
-#define SERVER_HOST "http://192.168.1.100:8000"
+#define SERVER_HOST "http://192.168.1.101:8000"
 
 // HTTP SETTING
 #define AUTH_HTTP_PATH "api/device"
@@ -60,7 +60,7 @@ typedef struct {
 } http_response_t;
 
 // WEBSOCKET SETTING
-#define WEBSOCKET_HOST "ws://192.168.1.100:8000"
+#define WEBSOCKET_HOST "ws://192.168.1.101:8000"
 #define WEBSOCKET_PATH "api/device/ws"
 #define NO_DATA_TIMEOUT_SEC 43200 // 30 Days
 static char MAC[18];
@@ -313,9 +313,12 @@ static void send_log_to_server(ActionType action, LogType level, const char* tag
     websocket_sending_message_t log_mes = {0};
     log_mes.action = ACTION_LOG;
     log_mes.text_payload = json_string;
-    if (xQueueSend(websocket_sending_message_queue, &log_mes, pdMS_TO_TICKS(100)) != pdPASS) {
-        ESP_LOGE("LOG_SENDER", "Failed to queue log message, freeing memory.");
-        free(json_string);
+    ESP_LOGI("LOG_SENDER", "json str: %s", json_string);
+    if(websocket_sending_message_queue == NULL){
+        ESP_LOGE("LOG_SENDER", "Failed to queue log message, because websocket_sending_message_queue is NULL");
+    }else{
+        xQueueSend(websocket_sending_message_queue, &log_mes, portMAX_DELAY);
+        ESP_LOGI("LOG_SENDER", "Success to queue log message.");
     }
 }
 
@@ -529,7 +532,7 @@ static void websocket_sending_task(void* pvParameters){
     while(1){
         
         // Waiting for websocket connected
-        ESP_LOGI("WS_SENDER", "Waiting for websocket connection bit...");
+        ESP_LOGI("Websocket Sending Task", "Waiting for websocket connection bit...");
         xEventGroupWaitBits(
             g_system_event_group,
             EVT_GRP__BIT_WEBSOCKET_CONNECTED,
@@ -543,7 +546,9 @@ static void websocket_sending_task(void* pvParameters){
             
             if(msg.action == ACTION_LOG){
                 if(msg.text_payload != NULL){
-                    esp_websocket_client_send_text(websocket_client, msg.text_payload, strlen(msg.text_payload), portMAX_DELAY);
+                    int len = strlen(msg.text_payload);
+                    ESP_LOGI("Websocket Sending Task", "ACTION: LOG, sending message: %s, bytes: %d", msg.text_payload, len);
+                    esp_websocket_client_send_text(websocket_client, msg.text_payload, len, portMAX_DELAY);
                     free(msg.text_payload);
                 }
             }else if(msg.op_code == 0x01){
@@ -1179,6 +1184,12 @@ static void take_picture(){
     ESP_LOGI("Camera", "Picture taken! Its size was: %zu bytes, width: %zu, height: %zu.", pic->len, pic->width, pic->height);
 
     //  if websocket does't connected, and then release resouces and continues
+    if(websocket_client == NULL){
+        ESP_LOGE("Websocket", "Websocket client instance is NULL.");
+        esp_camera_fb_return(pic);
+        return;
+    }
+
     bool websocket_connected = esp_websocket_client_is_connected(websocket_client);
     if(!websocket_connected){
         ESP_LOGE("Websocket", "Websocket doesn't connected.");
@@ -1363,6 +1374,7 @@ static void websocket_handler(void *handler_args, esp_event_base_t base, int32_t
             break;
         case WEBSOCKET_EVENT_FINISH:
             ESP_LOGI("Websocket", "WEBSOCKET_EVENT_FINISHE");
+            xEventGroupClearBits(g_system_event_group, EVT_GRP__BIT_WEBSOCKET_CONNECTED);
             break;
     }
 }
@@ -1563,7 +1575,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
     }else if(event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP ) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*)event_data;
         ESP_LOGI("IP Event", "Got ip:" IPSTR, IP2STR(&event->ip_info.ip));
-        send_log_to_server(ACTION_LOG, LOG_LEVEL_INFO, "WIFI", "Connected to AP, IP: %s", IP2STR(&event->ip_info.ip));
+        // send_log_to_server(ACTION_LOG, LOG_LEVEL_INFO, "WIFI", "Connected to AP, IP: %s", IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     
@@ -1965,8 +1977,8 @@ extern "C" void app_main(void){
      * 5. split code
      */
     // power_management_init();
-    application_rtos_init();
     nvs_init();
+    application_rtos_init();
     sdmmc_card_init_task();
     get_sha256_of_partitions();
     wifi_init_task();
