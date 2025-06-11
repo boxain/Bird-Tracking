@@ -1692,12 +1692,23 @@ static char* http_message2json(){
         return NULL;
     }
 
+    // Get Chip name
+    esp_chip_info_t chip_info;
+    esp_chip_info(&chip_info);
+    char chip[8];
+    if(chip_info.model == CHIP_ESP32S3){
+        snprintf(chip, sizeof(chip), "ESP32S3");
+    }else{
+        snprintf(chip, sizeof(chip), "ESP32P4");
+    }
+
+
     snprintf(MAC, sizeof(MAC), "%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     ESP_LOGI("MAC", "MAC Address is: %s", MAC);
     cJSON* root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "name", "esp32s3");
-    cJSON_AddStringToObject(root, "processor", "esp32s3");
+    cJSON_AddStringToObject(root, "chip", chip);
     cJSON_AddStringToObject(root, "mac", MAC);
+    // Update to temporary token to get JWT token
     cJSON_AddStringToObject(root, "user_name", CONFIG_ESP_SERVER_USERNAME);
     cJSON_AddStringToObject(root, "password", CONFIG_ESP_SERVER_PASSWORD);
     char* result = cJSON_Print(root);
@@ -1976,9 +1987,9 @@ extern "C" void app_main(void){
      * 4. device authentication 
      * 5. split code
      */
-    // power_management_init();
-    nvs_init();
+    // power_management_init();    
     application_rtos_init();
+    nvs_init();
     sdmmc_card_init_task();
     get_sha256_of_partitions();
     wifi_init_task();
