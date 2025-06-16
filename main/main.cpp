@@ -38,7 +38,9 @@
 #include "esp_ota_ops.h"
 
 #include "dl_model_base.hpp"
-#include "cat_detect.hpp"
+// #include "cat_detect.hpp"
+#include "model_factory.hpp"
+
 
 
 // WIFI SETTING
@@ -49,7 +51,7 @@ static int s_retry_num = 0;
 static EventGroupHandle_t s_wifi_event_group;
 
 // SERVER SETTING
-#define SERVER_HOST "http://192.168.1.101:8000"
+// #define HTTP_HOST "http://192.168.1.101:8000"
 
 // HTTP SETTING
 #define AUTH_HTTP_PATH "api/device"
@@ -60,7 +62,7 @@ typedef struct {
 } http_response_t;
 
 // WEBSOCKET SETTING
-#define WEBSOCKET_HOST "ws://192.168.1.101:8000"
+// #define WEBSOCKET_HOST "ws://192.168.1.101:8000"
 #define WEBSOCKET_PATH "api/device/ws"
 #define NO_DATA_TIMEOUT_SEC 43200 // 30 Days
 static char MAC[18];
@@ -208,7 +210,8 @@ static esp_err_t init_camera(void)
 sdmmc_card_t* card;
 
 // Model Setting
-CatDetect* model;
+// CatDetect* model;
+ObjectDetectModel* model;
 static SemaphoreHandle_t g_model_mutex;
 typedef struct {
     FILE* file;
@@ -423,7 +426,7 @@ static void model_init(char* model_id, char* task_id){
         }
 
         // Must setting FAT LFN ( Long File Name)
-        model = new CatDetect(path);
+        model = new ObjectDetectModel(path);
         if(model){
             ESP_LOGI("MODEL SWITCH", "Success");
             // Sending completed message
@@ -1384,7 +1387,11 @@ static void websocket_handler(void *handler_args, esp_event_base_t base, int32_t
 static void websocket_init_task(char* access_token){
     // Setting Websockt config
     char websocket_path[50];
-    snprintf(websocket_path, size_t(websocket_path), "%s/%s", WEBSOCKET_HOST, WEBSOCKET_PATH);
+#ifdef CONFIG_ESP_SERVER_TLS
+    snprintf(websocket_path, size_t(websocket_path), "wss://%s/%s", CONFIG_ESP_SERVER_HOST, WEBSOCKET_PATH);      
+#else
+    snprintf(websocket_path, size_t(websocket_path), "ws://%s/%s", CONFIG_ESP_SERVER_HOST, WEBSOCKET_PATH);
+#endif    
     ESP_LOGI("Websocket", "Path: %s", websocket_path);
 
     esp_websocket_client_config_t websocket_cfg = {};
@@ -1722,7 +1729,11 @@ static char* http_message2json(){
 static char* auth_http_request(){
     ESP_LOGI("AUTH_HTTP_REQUEST", "Starting");
     char http_path[50];
-    snprintf(http_path, size_t(http_path), "%s/%s", SERVER_HOST, AUTH_HTTP_PATH);
+#ifdef CONFIG_ESP_SERVER_TLS
+    snprintf(http_path, size_t(http_path), "https://%s/%s", CONFIG_ESP_SERVER_HOST, AUTH_HTTP_PATH);
+#else
+    snprintf(http_path, size_t(http_path), "http://%s/%s", CONFIG_ESP_SERVER_HOST, AUTH_HTTP_PATH);
+#endif
     ESP_LOGI("AUTH_HTTP_REQUEST", "Path: %s", http_path);
 
     http_response_t* params = (http_response_t*)malloc(sizeof(http_response_t));
@@ -1843,7 +1854,7 @@ void wifi_init_task(){
         wifi_prov_security_t secuirty = WIFI_PROV_SECURITY_1;        
         const char* pop = CONFIG_ESP_WIFI_POP;
         wifi_prov_security1_params_t* sec_params = pop;
-        const char* service_key = CONFIG_ESP_WIFI_PASSWORD;
+        const char* service_key = CONFIG_ESP_PROVISIONING_WIFI_PASSWORD;
 
         /* Start provisioning service */
         ESP_ERROR_CHECK(wifi_prov_mgr_start_provisioning(secuirty, (const void*)sec_params, service_name, service_key));
@@ -1982,10 +1993,6 @@ static void application_rtos_init(){
 extern "C" void app_main(void){
     /**
      * 1. customize model init class
-     * 2. nvs
-     * 3. log
-     * 4. device authentication 
-     * 5. split code
      */
     // power_management_init();    
     application_rtos_init();
